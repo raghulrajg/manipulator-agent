@@ -10,7 +10,9 @@ MovJ and MovL both move linearly in joint space here (the real MovL is a
 straight tool line; the pick only uses it on lines the planner checked).
 
 Faults for the tests: fault=("collision", n) stops the n-th motion halfway
-in RobotMode 11; fault=("short", n) ends it 1 deg short of its target.
+in RobotMode 11; fault=("short", n) ends it 1 deg short of its target;
+fault=("stuck", n) leaves it halfway, still "running", with its joint
+readings jittering 0.02 deg (until Stop).
 """
 
 import math
@@ -166,11 +168,16 @@ class FakeDobot:
                 with self.lock:
                     if self.mode != 7:          # stopped from outside
                         break
-                    self.joints = start + s * (target - start)
+                    stuck = fault_here and kind == "stuck" and s >= 0.5
+                    if stuck:
+                        flip = 1 if int(time.monotonic() * 200) % 2 else -1
+                        self.joints = start + 0.5 * (target - start) + 0.02 * flip
+                    else:
+                        self.joints = start + s * (target - start)
                     if fault_here and kind == "collision" and s >= 0.5:
                         self.mode, self.queue = 11, []
                         break
-                    if s >= 1.0:
+                    if s >= 1.0 and not stuck:
                         self.mode = 5
                         break
                 time.sleep(0.005)

@@ -9,7 +9,7 @@ x-trainer's DobotGripper (xtrainer_utils/dobot_control/gripper):
     right arm (robot 192.168.5.2): servo ID 22 on /dev/ttyUSB0
     raw position 2048 open, 3052 closed, 1 Mbaud
 
-Positions are 0 (open) .. 255 (closed) and speeds 0..100 %, scaled to the
+Positions are 0 (open) .. 255 (closed) and speeds 1..100 %, scaled to the
 servo's raw counts the way DobotGripper does. The torque limit (register
 48, 0..1000, default 300 as in x-trainer) is what the fingers squeeze with.
 
@@ -69,10 +69,14 @@ class FeetechGripper:
         if not self.port_handler.setBaudRate(self.baudrate):   # also opens the port
             raise GripperError(f"cannot open {self.port} at {self.baudrate} baud")
         self.servo = sms_sts(self.port_handler)
-        _, comm, err = self.servo.ping(self.servo_id)
-        self._check(comm, err, f"ping servo {self.servo_id} on {self.port}")
-        comm, err = self.servo.write2ByteTxRx(self.servo_id, TORQUE_LIMIT_ADDR, self.torque_limit)
-        self._check(comm, err, "set the torque limit")
+        try:
+            _, comm, err = self.servo.ping(self.servo_id)
+            self._check(comm, err, f"ping servo {self.servo_id} on {self.port}")
+            comm, err = self.servo.write2ByteTxRx(self.servo_id, TORQUE_LIMIT_ADDR, self.torque_limit)
+            self._check(comm, err, "set the torque limit")
+        except Exception:
+            self.disconnect()
+            raise
         return self
 
     def disconnect(self):
@@ -189,7 +193,8 @@ def main():
     args = parser.parse_args()
 
     side = LEFT if args.arm == "left" else RIGHT
-    g = FeetechGripper(args.port or side["port"], args.id or side["servo_id"], torque_limit=args.torque)
+    g = FeetechGripper(args.port or side["port"], side["servo_id"] if args.id is None else args.id,
+                       torque_limit=args.torque)
     print(f"gripper: servo ID {g.servo_id} on {g.port}")
     try:
         g.open()

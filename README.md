@@ -18,13 +18,17 @@ robot side adds paho-mqtt and pyserial, the simulation matplotlib.
 | `pick_runner.py` | **The real-time pick.** Sends "ready" over MQTT, takes the pose the vision PC sends back, plans with the IK and table check, drives the arm with Dobot MovJ / MovL, checks the target is reached (joints and the controller's own pose) before gripping, grips, lifts, places, goes home. See "Real-time pick on the robot" below. |
 | `dobot_tcp.py` | Nova 2 TCP/IP client (controller V4, port 29999, the guide in `Docs/`): enable, MovJ / MovL to joint targets, wait until done (queue ID, RobotMode, reached), GetAngle, GetPose, alarms. Run it alone to read the robot's state. |
 | `gripper.py` | Feetech SMS/STS gripper through `scservo_sdk/` (your SDK, unchanged), with x-trainer's settings: left arm (robot 192.168.5.1) ID 21 on /dev/ttyUSB1, right arm (192.168.5.2) ID 22 on /dev/ttyUSB0, raw 2048 open … 3052 closed. `close()` tells whether the fingers stopped on something. |
+| `scservo_sdk/` | Feetech's SCServo Python SDK (SMS/STS and SCSCL servos, port handler), your copy unchanged. `gripper.py` uses it; it needs pyserial. |
 | `mqtt_link.py` | Shared by both sides: topics, the ready / pose / status messages, the paho-mqtt client, and `PoseGate` (ready → found → still 2.5 s → send once). |
 | `foundationpose_mqtt.py` | Your FoundationPose tomato script with MQTT added: idle until "ready", then detect, track, wait until the pose has held 2.5 s, publish it once, idle again. Runs on the vision PC. |
 | `fake_dobot.py` | A fake Nova 2 controller on localhost (same commands and replies) for `pick_runner.py --dry-run` and the tests. |
 | `test_manipulator.py` | Offline checks: FK against Dobot's official Nova 2 model and the DH tables, IK round trip, table constraint, full detect → pick plan. |
 | `test_ik_random.py` | Random joint angles → FK (tool tip transform) → IK → joint angles, compared with the originals. Also covers joints exactly at their limits and every singular pose. |
 | `test_pick_runner.py` | Offline checks of the robot side: the Dobot client against the fake controller (collision, stopping short, old firmware, limits), the gripper against a fake servo, the MQTT messages and `PoseGate`, and whole pick cycles (success, missed grip, unreachable, arm moved, wrong model, collision). `--broker HOST` also goes through a real MQTT broker. |
-| `test_vision_mqtt.py` | Runs `foundationpose_mqtt.py`'s real main loop with fake camera / YOLO / SAM / FoundationPose / broker: nothing before a ready, one pose per ready only after 2.5 s of steady tracking, repeats ignored, losing the tomato restarts the wait. |
+| `test_vision_mqtt.py` | Runs `foundationpose_mqtt.py`'s real main loop with fake camera / YOLO / SAM / FoundationPose / broker: nothing before a ready; a pose only after 2.5 s of steady tracking, with the ready's request_id; a repeat of an answered ready gets the same pose again within 10 s and a fresh detection after that; losing the tomato, or holding its last pose while depth drops out, restarts the wait. |
+| `Docs/` | Dobot's TCP/IP Remote Control Interface Guide V4.6.0 (the commands `dobot_tcp.py` sends) and the Nova series user guide (PDF). |
+| `Helpers scripts/` | Your original scripts (`joint_mapping.py`, `effective_transformation.py`, `tooltip_transformation.py`, `camera_tranformation.py`, `nova2_control.py`), kept for reference. They still have the old J1/J3/J5 offsets (see the correction section). |
+| `requirements.txt` | numpy, plus matplotlib (simulation), paho-mqtt (MQTT) and pyserial (gripper). |
 
 ```
 pip install -r requirements.txt
@@ -36,7 +40,7 @@ python3 ik_from_pose.py --xyz -0.40 0.10 0.05 --yaw 30 --table-z -0.05
 python3 ik_from_pose.py --object T_camera_object.txt --frame camera --xyz 0 0 0.30
 python3 simulate_pick.py                         # pick-and-place simulation -> pick.gif
 python3 simulate_pick.py --object -0.45 0.05 0.0 30 --place -0.25 0.40 --save pick.mp4
-python3 simulate_pick.py --pose T_camera_object.txt --show   # FoundationPose result, live window
+python3 simulate_pick.py --pose T_camera_object.txt --show   # 4x4 object pose (bottom-centre origin, +z up), live window
 python3 test_ik_random.py                        # 1000 random poses, first 3 printed in full
 python3 test_ik_random.py --n 10000 --seed 42 --show 5
 python3 test_manipulator.py
@@ -46,6 +50,10 @@ python3 test_pick_runner.py                      # robot side, no hardware (add 
 python3 test_vision_mqtt.py                      # vision MQTT flow, no camera or GPU
 python3 pick_runner.py --dry-run --fake-vision demo   # whole pick cycle, no hardware or broker
 ```
+
+`simulate_pick.py --pose` needs the object frame at its bottom centre with
++z up. FoundationPose's tomato pose has its origin at the centre and its
+axes parallel to the camera, so convert it first, or the script refuses it.
 
 ## Real-time pick on the robot
 
@@ -61,6 +69,7 @@ joint targets the IK chose and checks each one is reached before going on.
 One cycle:
 
 1. The arm is at the detection pose (home) and holding still, with the gripper open.
+   At start the runner moves it there with a table-checked MovJ.
 2. It publishes **ready**. The vision PC finds the tomato and tracks it. Once the
    tomato has held still for **2.5 s**, the PC publishes `T_camera_object`.
 3. The runner reads the joints, computes
@@ -70,7 +79,8 @@ One cycle:
    to the grasp.
 5. **Measure** before gripping. The joints (GetAngle → FK) must put the tool tip
    within 2 mm and 1° of the grasp. The controller's own flange position
-   (GetPose) must agree.
+   (GetPose) must agree within 5 mm (`--reach-tol-mm` plus the 3 mm model
+   tolerance).
 6. **Close** the gripper. The fingers have to stop on the tomato. If they close
    all the way, it opens, goes back up and home, and reports "failed".
 7. **MovL** straight up. With `--place X Y` it then does MovJ above the place
@@ -89,13 +99,17 @@ One cycle:
 - **Vision PC:** copy `foundationpose_mqtt.py` and `mqtt_link.py` into the
   folder with `FoundationPose/`, `meshes/`, the SAM checkpoint,
   `precise_6dof_pose.py` and the camera modules. Install `paho-mqtt`, then run
-  `python3 foundationpose_mqtt.py` (or add `--local-camera`). SPACE makes it
-  look without a ready message, for bench tests.
+  `python3 foundationpose_mqtt.py`. It takes frames from router.py
+  (remote_camera, 127.0.0.1:5601); add `--local-camera` for a RealSense
+  plugged into the vision PC. SPACE makes it look without a ready message,
+  for bench tests. A running pick_runner.py will act on that pose.
 - **Both:** set the same broker variables as your scheduler stack:
   `MQTT_BROKER_HOST`, `MQTT_BROKER_PORT`, `MQTT_USERNAME`, `MQTT_PASSWORD`.
   Topics default to `manipulator/ready`, `manipulator/object_pose` and
   `manipulator/status`. Change them with `MQTT_READY_TOPIC`, `MQTT_POSE_TOPIC`
-  and `MQTT_STATUS_TOPIC`. Keep credentials in `.env`, which is git-ignored.
+  and `MQTT_STATUS_TOPIC`. Keep credentials in `.env` (git-ignored) and
+  export them before running, e.g. `set -a; . ./.env; set +a`. The scripts
+  read only environment variables (broker default localhost:1883).
 
 **Messages** (JSON):
 
@@ -105,23 +119,33 @@ ready  {"request_id": "3f9a01c2", "joints": [-180, 0, -90, 0, 90, 90], "stamp": 
 pose   {"request_id": "3f9a01c2", "object": "tomato", "origin": "center", "symmetric": true,
         "diameter": 0.062, "settle_s": 2.5, "frame": "camera",
         "T_camera_object": [[1,0,0,0.03],[0,1,0,-0.02],[0,0,1,0.38],[0,0,0,1]], "stamp": ...}
-status {"request_id": "3f9a01c2", "state": "waiting|picking|holding|placed|done|failed|stopped", "detail": "..."}
+status {"request_id": "3f9a01c2", "state": "waiting|picking|holding|placed|done|failed|finished|stopped",
+        "detail": "...", "stamp": ...}
 ```
+
+When the runner exits it publishes "finished" (all cycles ran; detail
+"N cycles, M failed") or "stopped" (an error or Ctrl+C stopped the robot).
 
 The runner sends ready again every 5 s until a pose arrives. This covers a
 vision PC that started late or a pose message that was lost. If the vision
-side is still working on that request, it ignores the repeat. If it has
-already answered, it sends the same pose again. A pose with another
-`request_id` is ignored. An invalid ready message is logged and skipped.
+side is still working on that request, it ignores the repeat. If it
+answered less than 10 s ago, it sends the same pose again. If the answer is
+older, it detects again, because the tomato may have moved. A pose with
+another `request_id` is ignored. A pose with none (an answer to a plain
+"ready", or SPACE on the vision PC) is accepted, so don't press SPACE while
+the arm is waiting. An invalid ready message is logged and skipped.
 
 **What is checked, and what happens if it fails**
 
 | When | Check | If it fails |
 |---|---|---|
 | Start | GetPose (tool 0) matches the FK of GetAngle within 3 mm | Refuses to run: the kinematic model doesn't match the controller (see the next section) |
+| Start | If the arm is not at home, the MovJ home is checked against the table. A dry run without `--table-z` only warns. Then the arm moves home | Refuses to run: jog the arm closer to home first |
+| Every cycle | RobotMode is 5 (enabled and idle) before ready is sent | Stops |
+| Waiting for the pose | `--pose-timeout S` (default: wait forever) | "failed", next cycle |
 | Pose received | The joints did not change while the camera looked | Stops |
 | Before moving | Every waypoint IK-solved above the table, every 2 cm on the lines down and up, and the joint paths between them | "failed"; the arm does not move |
-| Every move | Done = its queue ID is current, RobotMode 5, and at the target (MovJ: joints within 0.3°; MovL: tool tip within 2 mm and 1°). Alarm, collision, disable, stopping short, or no joint moving for 60 s (a pause counts) → error. A slow move is fine as long as it keeps moving | Stop() is sent, then the script exits |
+| Every move | Done = its queue ID is current, RobotMode 5, and at the target (MovJ: joints within 0.3°; MovL: tool tip within 2 mm and 1°). Any of these → error: an alarm, a collision, a disable, stopping short, no joint moving 0.05° for 60 s (a pause counts, reading noise doesn't), or 30 min in all. A slow move is fine as long as it keeps moving | Stop() is sent, then the script exits |
 | Before closing or opening | GetAngle → FK tool tip and GetPose flange are both at the target | Stops |
 | After closing | The fingers stopped short of fully closed (30 servo counts) | Opens, MovL up, MovJ home, "failed" |
 
@@ -140,13 +164,15 @@ python3 pick_runner.py --robot-ip 192.168.5.2 --table-z -0.05          # right a
 Notes:
 
 - **`--table-z`** (required on the robot): the table surface in the base
-  frame, in meters. Measure it once. Jog the tool tip onto the table and read
-  the flange z; with the tool pointing down, the tip is 0.197 m below the
-  flange. A value that isn't between −1 m and 5 cm below the tool tip at home
-  is refused, which catches a reading typed in mm. Only `--dry-run` may
-  leave it out. It then estimates the table as the tomato's centre minus
-  half its diameter, but the table height must not come from the same
-  camera pose as the grasp.
+  frame, in meters. Measure it once: with tool 0 selected, jog the tool tip
+  onto the table, read the flange z and subtract 0.197 m (with the tool
+  pointing down the tip is 0.197 m below the flange). If the pendant shows
+  x-trainer's tool 1, it already reads the tip. A value that isn't between
+  −1 m and 5 cm below the tool tip at home is refused, which catches a
+  reading typed in mm. Only `--dry-run` may leave it out; it then estimates
+  the table as the tomato's centre minus half its diameter. The real robot
+  needs the measured value, because an estimate from the same camera pose
+  as the grasp would carry the same error.
 - **Grasp point:** FoundationPose's tomato frame is its centre, because the mesh is
   centred on its bounding box. The tool tip goes to the centre
   (`--grasp-height 0`). For an object whose frame is its bottom
@@ -156,8 +182,13 @@ Notes:
   home. `--grasp-yaw` adds a turn.
 - **Speeds:** `--speed` is the MovJ speed and acceleration in %. `--line-speed`
   is the same for MovL. Both are multiplied by the controller's global speed,
-  which stays as set on the pendant unless you pass `--speed-factor N`. Use
-  10 for the first runs.
+  which stays as set on the pendant unless you pass `--speed-factor N`.
+  Defaults: `--speed 20`, `--line-speed 10`. Use 10 for the first runs.
+- **Other options:** `--approach` sets the pre-grasp height above the grasp
+  (0.10 m). `--reach-tol-mm` sets the tool tip tolerance (2). `--pose-timeout
+  S` gives up waiting for the vision after S seconds and reports "failed".
+  `--fake-vision FILE` answers ready with this 4x4 `T_camera_object` instead
+  of a vision PC. `python3 pick_runner.py --help` lists them all.
 - **Squeeze:** `--grip-torque` sets the servo torque limit (0..1000). The default
   300 is x-trainer's value. Go lower if it squashes the tomato.
 - **Without `--place`:** the arm ends at home holding the tomato, so only
@@ -312,6 +343,9 @@ inverse, `plan.T_object_base`.
 
 **Table height:** `table_z` in the base frame. With `table_z=None` it is the
 plane the detected object sits on, since the ArUco markers lie on the table.
+That is for planning offline. On the robot, pass the measured height
+(`pick_runner.py` requires `--table-z`). A table height taken from the same
+camera pose as the grasp would share its error.
 The table is treated as an endless floor at that height. Pass
 `table_x_range` / `table_y_range` if the arm also works beside the table,
 lower than its top.
@@ -322,7 +356,7 @@ lower than its top.
 from manipulator_agent import ManipulatorAgent, pose_from_rvec_tvec
 from manipulator_kinematics import IKError, joint_map
 
-agent = ManipulatorAgent(table_z=None)   # None: table = plane the markers lie on
+agent = ManipulatorAgent(table_z=TABLE_Z)   # measured once, see --table-z; None (the object's plane) is for offline planning only
 
 # 1. Move the arm to home (joint_map.home_servo_deg) and detect the object there.
 T_camera_object = pose_from_rvec_tvec(rvec, tvec)
@@ -467,10 +501,11 @@ and by the pendant reading above.
 camera, GPU or broker. I mutation-tested them: I injected one bug at a
 time, each on its own copy, and checked whether the tests failed.
 
-- **`test_pick_runner.py` caught 20 of 21.** Caught:
+- **`test_pick_runner.py` caught 21 of 22.** Caught:
   - returning before the move ends (no queue-ID check)
   - ignoring a collision or a stop short of the target
   - timing out on a slow move that is still moving
+  - waiting forever on a stuck robot whose readings jitter
   - letting NaN past the joint limits
   - a gripper that always reports "holding"
   - three `PoseGate` timing bugs
@@ -487,13 +522,14 @@ time, each on its own copy, and checked whether the tests failed.
   The miss changes nothing for a top-down grasp: it placed the tool, rather
   than the object, at the place spot, and for a top-down grasp they are the
   same point.
-- **`test_vision_mqtt.py` caught 6 of 7.** Caught:
+- **`test_vision_mqtt.py` caught 7 of 8.** Caught:
   - not restarting the 2.5 s when the tomato is lost
   - detecting before a ready
   - counting a held (no-depth) pose
   - dropping the request ID
   - a shorter settle time
   - not sending the pose again when the arm repeats an answered ready
+  - re-sending a pose that is too old
 
   The miss changes nothing either: it skipped a registration reset that the
   next ready does anyway.

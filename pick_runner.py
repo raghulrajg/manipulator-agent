@@ -26,7 +26,8 @@ A missed grip opens the gripper, goes back up and home, and reports
 the robot and the script.
 
 Table height: --table-z, the table surface in the base frame, measured
-once (touch it with the tool tip and read the pose). It is required on the
+once (jog the tool tip onto the table, read the flange z with tool 0 and
+subtract 0.197 m). It is required on the
 real robot; only --dry-run may estimate it from the message (the object's
 center minus half its diameter).
 
@@ -389,9 +390,13 @@ def main():
     else:
         robot = DobotTCP(args.robot_ip)
         side = LEFT if args.arm == "left" else RIGHT
-        gripper = FeetechGripper(args.gripper_port or side["port"], args.gripper_id or side["servo_id"],
-                                 torque_limit=args.grip_torque)
-        print(f"robot {args.robot_ip}, {args.arm} gripper: servo ID {gripper.servo_id} on {gripper.port}")
+        port = args.gripper_port or side["port"]
+        servo_id = side["servo_id"] if args.gripper_id is None else args.gripper_id
+        print(f"robot {args.robot_ip}, {args.arm} gripper: servo ID {servo_id} on {port}")
+        try:
+            gripper = FeetechGripper(port, servo_id, torque_limit=args.grip_torque)
+        except (GripperError, OSError) as e:   # serial.SerialException is an OSError
+            sys.exit(f"error: gripper: {e}")
 
     runner = PickRunner(robot, gripper, link, home, args.table_z, args.place,
                         dict(approach_height=args.approach, grasp_yaw_offset_deg=args.grasp_yaw,

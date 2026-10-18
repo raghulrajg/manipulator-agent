@@ -8,7 +8,8 @@ and the arm (pick_runner.py). Copy this file next to foundationpose_mqtt.py.
               "arm is still at the detection pose, find the object"
               (a plain "ready" payload works too, e.g. from mosquitto_pub)
     vision -> MQTT_POSE_TOPIC   {"request_id", "T_camera_object" (4x4, m),
-              "object", "origin", "symmetric", "diameter", "settle_s", "stamp"}
+              "object", "origin", "symmetric", "frame": "camera", "diameter",
+              "settle_s", "stamp"}
     arm    -> MQTT_STATUS_TOPIC {"request_id", "state", "detail", "stamp"}
 
 Broker settings come from the same environment variables as the rest of
@@ -34,6 +35,7 @@ STATUS_TOPIC = os.environ.get("MQTT_STATUS_TOPIC", "manipulator/status")
 
 SETTLE_SECONDS = 2.5   # object tracked and still this long before its pose is sent
 SETTLE_MOVE = 0.01     # [m] a pose that moves more than this restarts the wait
+RESEND_MAX_AGE = 10.0  # [s] a repeated ready gets the sent pose again only this soon after
 
 
 class MessageError(ValueError):
@@ -147,6 +149,11 @@ class PoseGate:
 
     def restart(self):
         self._since = self._anchor = None
+
+    def forget(self, request_id):
+        """Treat request_id as never answered (its pose is too old to send
+        again), so arm() takes it for a fresh detection."""
+        self.answered.discard(request_id)
 
     def remaining(self, now):
         """Seconds still to wait, None while no pose is being timed."""

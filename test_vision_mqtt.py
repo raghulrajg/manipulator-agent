@@ -8,8 +8,9 @@ no camera), and checks the MQTT behaviour:
   - nothing is detected or sent before a ready message
   - after a ready: detect -> register -> track, and the pose is sent once,
     only after 2.5 s of steady tracking, with the ready's request_id
-  - a repeated ready gets the same pose again (the first one was lost),
-    a new one starts a fresh detection
+  - a repeated ready gets the same pose again (the first one was lost) if
+    it was sent less than 10 s ago, and a fresh detection otherwise; a new
+    ready starts a fresh detection
   - losing the tomato, or holding its last pose while depth drops out,
     restarts the 2.5 s
 
@@ -229,7 +230,15 @@ def test_ready_settle_publish():
     print("foundationpose_mqtt.py main loop with fake camera / models / broker")
     print("=" * 60)
     sent_at = []
-    script = {10: ready("q1"), 60: ready("q1"), 70: ready("q2")}
+    start = TOMATO.copy()
+    moved = start + [0.03, 0.0, 0.0]
+
+    def move_tomato():
+        TOMATO[:] = moved
+
+    # q1 repeated 2 s after its pose went out (lost on the way): same pose again;
+    # q2 repeated 15 s after, the tomato moved in between: too old, detect again
+    script = {10: ready("q1"), 60: ready("q1"), 70: ready("q2"), 200: move_tomato, 300: ready("q2")}
 
     # record the frame each pose goes out
     orig_publish = LocalBus.publish
@@ -241,29 +250,33 @@ def test_ready_settle_publish():
 
     LocalBus.publish = publish
     try:
-        world, est = run(script, last_frame=170, hidden=range(85, 100), holes=range(115, 121))
+        world, est = run(script, last_frame=360, hidden=range(85, 100), holes=range(115, 121))
     finally:
         LocalBus.publish = orig_publish
+        TOMATO[:] = start
 
     poses = [json.loads(json.dumps(m)) for t, m in world.bus.sent if t == POSE_TOPIC]
-    assert [p["request_id"] for p in poses] == ["q1", "q1", "q2"], poses
+    assert [p["request_id"] for p in poses] == ["q1", "q1", "q2", "q2"], poses
     assert min(world.detect_frames) >= 10, "detected before the ready"   # ready arrives in frame 10
     assert not [f for f in world.detect_frames if sent_at[0] < f < 70], "detected while idle after sending"
+    assert not [f for f in world.detect_frames if sent_at[2] < f < 300], "detected while idle after sending"
     # the repeated q1 ready (the arm never got the pose) gets the same pose again, no new detection
     assert sent_at[1] == 60 and poses[1] == poses[0], (sent_at, poses[1])
-    poses, sent_at = [poses[0], poses[2]], [sent_at[0], sent_at[2]]
+    fresh = [(poses[0], sent_at[0], start), (poses[2], sent_at[2], start), (poses[3], sent_at[3], moved)]
 
-    for p, f in zip(poses, sent_at):
+    for p, f, where in fresh:
         reg = max(r for r in est.registrations if r < f)
         assert (f - reg) * FRAME_DT >= 2.5 - 1e-9, f"sent {(f - reg) * FRAME_DT:.1f} s after registering"
         T = np.array(p["T_camera_object"])
-        assert np.allclose(T[:3, :3], np.eye(3)) and np.allclose(T[:3, 3], TOMATO, atol=0.003), T
+        assert np.allclose(T[:3, :3], np.eye(3)) and np.allclose(T[:3, 3], where, atol=0.003), (T, where)
         assert p["symmetric"] and p["origin"] == "center" and p["diameter"] == DIAMETER and p["object"] == "tomato"
     # the second request lost the tomato (frames 85-99) and was registered again after; then
     # depth dropped out (115-120, last pose held): the 2.5 s count only from live tracking after that
-    assert any(r >= 100 for r in est.registrations) and sent_at[1] >= 121 + 25, (est.registrations, sent_at)
-    print(f"OK: ready at frames 10 / 60 (repeat, pose sent again) / 70; registered at {est.registrations}; "
-          f"new poses sent at frames {sent_at} (10 fps)\n")
+    assert any(100 <= r < 146 for r in est.registrations) and sent_at[2] >= 121 + 25, (est.registrations, sent_at)
+    # the late q2 repeat was detected afresh, at the tomato's new place
+    assert any(r >= 300 for r in est.registrations), est.registrations
+    print(f"OK: ready at frames 10 / 60 (repeat, pose sent again) / 70 / 300 (repeat 15 s late, detected "
+          f"again); registered at {est.registrations}; poses sent at frames {sent_at} (10 fps)\n")
 
 
 if __name__ == "__main__":

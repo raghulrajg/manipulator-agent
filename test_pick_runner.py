@@ -146,6 +146,18 @@ def test_dobot_faults():
         assert "no joint has moved" in str(e) and time.monotonic() - t0 < 5, e
     fake.stop()
 
+    # stuck "running" with readings jittering 0.02 deg: noise is not progress
+    fake = FakeDobot(fault=("stuck", 1)).start()
+    robot = connected(fake)
+    t0 = time.monotonic()
+    try:
+        robot.move_j(target, v=100, timeout=1.0)
+        raise AssertionError("a stuck robot with jittering readings was waited for forever")
+    except DobotError as e:
+        assert "no joint has moved" in str(e) and time.monotonic() - t0 < 5, e
+    robot.stop()
+    fake.stop()
+
     # the fullwidth semicolon some firmware sends
     server = socket.socket()
     server.bind(("127.0.0.1", 0))

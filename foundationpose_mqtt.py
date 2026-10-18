@@ -33,7 +33,8 @@ import trimesh
 from scipy.spatial.transform import Rotation as Rot
 
 from mqtt_link import (
-    POSE_TOPIC, READY_TOPIC, MessageError, MqttLink, PoseGate, parse_ready, pose_message,
+    POSE_TOPIC, READY_TOPIC, RESEND_MAX_AGE, MessageError, MqttLink, PoseGate, parse_ready,
+    pose_message,
 )
 
 # Vision only: no manipulator / IK code in this version. The pose goes to
@@ -861,7 +862,7 @@ def main():
 
     gate = PoseGate()
 
-    # request_id -> pose message sent, to send again if the arm asks again
+    # request_id -> (pose message sent, when), to send again if the arm asks again
     sent_poses = {}
 
     print(
@@ -1123,7 +1124,18 @@ def main():
                     print(f"\nIgnoring message on {READY_TOPIC}: {e}")
                     continue
 
-                if gate.arm(ready["request_id"]):
+                rid = ready["request_id"]
+
+                if (
+                    rid in sent_poses
+                    and time.monotonic() - sent_poses[rid][1] > RESEND_MAX_AGE
+                ):
+                    # Too old to trust (the tomato may have moved): look
+                    # again, the arm is still at its detection pose
+                    del sent_poses[rid]
+                    gate.forget(rid)
+
+                if gate.arm(rid):
 
                     print(
                         f"\nReady received (request "
@@ -1137,12 +1149,12 @@ def main():
                     stable_counter = 0
                     previous_bbox = None
 
-                elif ready["request_id"] in sent_poses:
+                elif rid in sent_poses:
 
                     # The arm is still waiting: our pose did not reach it
                     link.publish(
                         POSE_TOPIC,
-                        sent_poses[ready["request_id"]]
+                        sent_poses[rid][0]
                     )
 
                     print(
@@ -1822,7 +1834,7 @@ def main():
                     )
 
                     if gate.request_id is not None:
-                        sent_poses[gate.request_id] = message
+                        sent_poses[gate.request_id] = (message, time.monotonic())
                         if len(sent_poses) > 20:
                             sent_poses.pop(next(iter(sent_poses)))
 

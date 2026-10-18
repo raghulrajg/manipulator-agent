@@ -209,15 +209,18 @@ class DobotTCP:
         queue ID (does not wait)."""
         return int(float(self.send(f"MovL({_joints_arg(servo_deg)},a={int(a)},v={int(v)})")))
 
-    def wait_motion(self, cmd_id, reached, timeout=60.0, what="move"):
+    def wait_motion(self, cmd_id, reached, timeout=60.0, what="move", max_wait=1800.0):
         """
         Poll until motion cmd_id is finished (its ID is current and the robot
         is idle) and reached(joints) is True; return the joints. Raises
         DobotError on an alarm, collision, disable, if the robot stops
-        somewhere else, or if no joint has moved for timeout seconds (a slow
-        move is fine as long as it keeps moving; a pause counts as stopped).
+        somewhere else, or if no joint has moved 0.05 deg for timeout seconds
+        (a slow move is fine as long as it keeps moving; a pause counts as
+        stopped; reading noise does not count as moving), or after max_wait
+        seconds in any case.
         """
-        t_moved, q_moved = time.monotonic(), None
+        t0 = t_moved = time.monotonic()
+        q_moved = None
         stopped_since = None
         while True:
             mode = self.robot_mode()
@@ -231,7 +234,7 @@ class DobotTCP:
             if done and reached(q):
                 return q
             now = time.monotonic()
-            if q_moved is None or np.abs(q - q_moved).max() > 0.01:
+            if q_moved is None or np.abs(q - q_moved).max() > 0.05:
                 t_moved, q_moved = now, q
             if done and cur is not None:
                 # finished but not there: give the last reading a moment, then fail
@@ -241,8 +244,9 @@ class DobotTCP:
                                      "not at the target")
             else:
                 stopped_since = None
-            if now - t_moved > timeout:
-                raise DobotError(f"{what}: no joint has moved for {timeout:.0f} s and it is not at the target "
+            if now - t_moved > timeout or now - t0 > max_wait:
+                raise DobotError(f"{what}: no joint has moved for {now - t_moved:.0f} s, {now - t0:.0f} s in all, "
+                                 f"and it is not at the target "
                                  f"(robot {MODE_NAMES.get(mode, mode)}, joints {np.round(q, 3).tolist()})")
             time.sleep(self.poll_s)
 
