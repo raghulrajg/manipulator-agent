@@ -1,1 +1,4 @@
 numpy>=1.20
+matplotlib>=3.5   # simulate_pick.py only
+paho-mqtt>=1.6    # pick_runner.py, foundationpose_mqtt.py (MQTT)
+pyserial>=3.4     # gripper.py (scservo_sdk)

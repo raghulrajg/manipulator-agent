@@ -245,6 +245,29 @@ class ManipulatorAgent:
         return line[::-1]
 
 
+def plan_place(agent, table, T_place_tool, q_start):
+    """Put the object down with the grasp it is held in: tool tip at
+    T_place_tool, approached straight down from approach_height above.
+    Returns [(name, T_base_tool, servo_deg)] pre -> place."""
+    T_pre = T_place_tool.copy()
+    T_pre[2, 3] += agent.approach_height
+    errors = []
+    for q_place in ik_solutions(T_place_tool, q_start, table):
+        try:
+            line = agent._vertical_line(table, T_pre, T_place_tool, q_place)  # straight line, one IK branch
+        except IKError as e:
+            errors.append(str(e))
+            continue
+        bad = table.path_violations(joint_map.servo_to_visual(q_start), joint_map.servo_to_visual(line[0][1]))
+        if bad:
+            errors.append("carry move goes below the table: " + ", ".join(bad))
+            continue
+        names = ["pre_place"] + ["lower"] * (len(line) - 2) + ["place"]
+        return [(n, T, q) for n, (T, q) in zip(names, line)]
+    raise IKError("cannot put the object down at "
+                  f"{np.round(T_place_tool[:3, 3], 4).tolist()}: " + " | ".join(dict.fromkeys(errors)))
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="Plan a top-down pick from an object detected by the wrist camera at home.")

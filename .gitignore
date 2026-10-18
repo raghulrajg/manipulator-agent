@@ -13,3 +13,6 @@ env/
 .vscode/
 
 commands.md
+
+# MQTT credentials
+.env
