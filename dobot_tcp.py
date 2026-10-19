@@ -108,6 +108,10 @@ class DobotTCP:
             self.sock.close()
             self.sock = None
 
+    @property
+    def connected(self):
+        return self.sock is not None
+
     def __enter__(self):
         return self.connect()
 
@@ -120,12 +124,16 @@ class DobotTCP:
         if self.sock is None:
             raise DobotError("not connected")
         with self._lock:
-            self.sock.sendall(cmd.encode("ascii"))
-            while b";" not in self._buf:
-                chunk = self.sock.recv(4096)
-                if not chunk:
-                    raise DobotError("connection closed by the robot")
-                self._buf = (self._buf + chunk).replace("；".encode(), b";")   # the guide shows both forms
+            try:
+                self.sock.sendall(cmd.encode("ascii"))
+                while b";" not in self._buf:
+                    chunk = self.sock.recv(4096)
+                    if not chunk:
+                        raise ConnectionError("connection closed by the robot")
+                    self._buf = (self._buf + chunk).replace("；".encode(), b";")   # the guide shows both forms
+            except OSError as e:
+                self.close()   # connected is False now; connect() again to go on
+                raise DobotError(f"{cmd}: connection lost ({e})") from None
             reply, self._buf = self._buf.split(b";", 1)
         text = reply.decode("utf-8", errors="ignore")
         m = _REPLY.match(text)
@@ -198,6 +206,13 @@ class DobotTCP:
     def stop(self):
         """Stop the motion queue now."""
         self.send("Stop()")
+
+    def start_drag(self):
+        """Drag mode: the arm can be moved by hand (RobotMode 6)."""
+        self.send("StartDrag()")
+
+    def stop_drag(self):
+        self.send("StopDrag()")
 
     # ------------------------------------------------------------ motion
     def mov_j(self, servo_deg, v=20, a=20):

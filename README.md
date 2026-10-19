@@ -5,7 +5,8 @@ with no end effector, the gripper tool tip, and the wrist camera, and the
 real-time pick on the Nova 2: MQTT to the vision PC, TCP/IP to the Dobot
 controller, RS485 to the Feetech gripper (same hardware as x-trainer). It is
 plain Python with no ROS2: the kinematics and planning need only numpy, the
-robot side adds paho-mqtt and pyserial, the simulation matplotlib.
+robot side adds paho-mqtt and pyserial, the simulation matplotlib, the
+digital twin aiohttp (and a browser).
 
 | File | What it does |
 |---|---|
@@ -21,10 +22,13 @@ robot side adds paho-mqtt and pyserial, the simulation matplotlib.
 | `scservo_sdk/` | Feetech's SCServo Python SDK (SMS/STS and SCSCL servos, port handler), your copy unchanged. `gripper.py` uses it; it needs pyserial. |
 | `mqtt_link.py` | Shared by both sides: topics, the ready / pose / status messages, the paho-mqtt client, and `PoseGate` (ready → found → still 2.5 s → send once). |
 | `foundationpose_mqtt.py` | Your FoundationPose tomato script with MQTT added: idle until "ready", then detect, track, wait until the pose has held 2.5 s, publish it once, idle again. Runs on the vision PC. |
-| `fake_dobot.py` | A fake Nova 2 controller on localhost (same commands and replies) for `pick_runner.py --dry-run` and the tests. |
+| `digital_twin.py` + `twin_web/` | **Digital twin**: a browser app with Dobot's own Nova 2 model that moves exactly as the robot does (real-time feedback) and moves the robot from the browser (checked MovJ / MovL, gripper, pick and place). `--sim` runs it on the fake controller. See "Digital twin" below. |
+| `dobot_feedback.py` | The controller's real-time feedback port (30004): the 1440-byte packet every 8 ms (actual joints, mode, tool pose, queue ID, drag state), parsed at the guide's byte offsets, read in a background thread. |
+| `fake_dobot.py` | A fake Nova 2 controller on localhost: dashboard commands and replies, a real-time feedback port, Nova 2 speeds (135°/s), straight-line MovL, drag mode, and moves "from the pendant". Used by `--dry-run`, `--sim` and the tests. |
 | `test_manipulator.py` | Offline checks: FK against Dobot's official Nova 2 model and the DH tables, IK round trip, table constraint, full detect → pick plan. |
 | `test_ik_random.py` | Random joint angles → FK (tool tip transform) → IK → joint angles, compared with the originals. Also covers joints exactly at their limits and every singular pose. |
 | `test_pick_runner.py` | Offline checks of the robot side: the Dobot client against the fake controller (collision, stopping short, old firmware, limits), the gripper against a fake servo, the MQTT messages and `PoseGate`, and whole pick cycles (success, missed grip, unreachable, arm moved, wrong model, collision). `--broker HOST` also goes through a real MQTT broker. |
+| `test_digital_twin.py` | Offline checks of the twin: the feedback packet layout, the URDF model against the kinematics, both directions of mirroring (incl. pendant and drag-mode moves), refusals (disarmed, limits, table, busy), STOP, pick and place, Detect, the WebSocket protocol, and a real browser run (with Playwright). |
 | `test_vision_mqtt.py` | Runs `foundationpose_mqtt.py`'s real main loop with fake camera / YOLO / SAM / FoundationPose / broker: nothing before a ready; a pose only after 2.5 s of steady tracking, with the ready's request_id; a repeat of an answered ready gets the same pose again within 10 s and a fresh detection after that; losing the tomato, or holding its last pose while depth drops out, restarts the wait. |
 | `Docs/` | Dobot's TCP/IP Remote Control Interface Guide V4.6.0 (the commands `dobot_tcp.py` sends) and the Nova series user guide (PDF). |
 | `Helpers scripts/` | Your original scripts (`joint_mapping.py`, `effective_transformation.py`, `tooltip_transformation.py`, `camera_tranformation.py`, `nova2_control.py`), kept for reference. They still have the old J1/J3/J5 offsets (see the correction section). |
@@ -49,11 +53,80 @@ python3 manipulator_agent.py 0.02 -0.03 0.30 20 --table-z -0.05
 python3 test_pick_runner.py                      # robot side, no hardware (add --broker localhost)
 python3 test_vision_mqtt.py                      # vision MQTT flow, no camera or GPU
 python3 pick_runner.py --dry-run --fake-vision demo   # whole pick cycle, no hardware or broker
+python3 digital_twin.py --sim                    # digital twin on a simulated robot: http://localhost:8080
+python3 test_digital_twin.py                     # digital twin, no hardware
 ```
 
 `simulate_pick.py --pose` needs the object frame at its bottom centre with
 +z up. FoundationPose's tomato pose has its origin at the centre and its
 axes parallel to the camera, so convert it first, or the script refuses it.
+
+## Digital twin (`digital_twin.py`)
+
+A browser app that shows the Nova 2 as Dobot's own model and moves it. The
+model is the URDF and meshes from
+[Dobot-Arm/TCP-IP-ROS-6AXis](https://github.com/Dobot-Arm/TCP-IP-ROS-6AXis),
+MIT-licensed and kept in `twin_web/model/nova2`. The twin follows the robot,
+and the robot follows the twin:
+
+```
+python3 digital_twin.py --sim                                        # simulated robot, open http://localhost:8080
+python3 digital_twin.py --robot 192.168.5.1 --table-z -0.05          # the real arm and its gripper
+python3 digital_twin.py --robot 192.168.5.1 --table-z -0.05 --mqtt   # + Detect with the vision PC
+python3 digital_twin.py --sim --fake-vision demo                     # Detect answered with a demo pose
+python3 dobot_feedback.py --ip 192.168.5.1                           # just print the feedback (read only)
+```
+
+**Robot → twin.** The controller's real-time feedback port (30004) sends
+the actual joint angles every 8 ms. The server pushes them to every open
+browser 30 times a second. The twin therefore shows whatever moves the arm:
+the app, the pendant, `pick_runner.py`, or a hand in drag mode. The app's
+own moves reach the screen the same way, so the twin never shows a motion
+the robot didn't make.
+
+**Twin → robot.** A browser command is checked on the server and sent to
+the robot as MovJ / MovL on port 29999 (the gripper over RS485). You then
+see it move through the feedback.
+
+| Panel | What it does |
+|---|---|
+| Robot | Enable, Disable, Clear alarm. Drag mode lets you move the arm by hand while the twin follows, and disarms the app. Speed is capped by `--max-speed`, default 50 %. |
+| Joints | Sliders preview a target as a see-through ghost, checked against the limits and the table. **Move joints** sends it, ± jogs one joint. |
+| Tool tip | Jog ±X / ±Y / ±Z as straight lines (MovL, the line checked every 5 mm). **Target** puts a tool target in the 3D view that you drag (T to move, R to turn); it previews the IK and then does **Move (joint)** or **Move (line)**. **Home**. |
+| Gripper | Open, Close. |
+| Pick & place | **Set object** / **Set place**, then click on the table; Ø sets the size. **Plan** shows the path and the grasp as a ghost. **Pick & place** runs `pick_runner.py`'s pick, including the reach check before gripping, and the tomato rides in the fingers. **Detect** (with `--mqtt`) goes home, sends ready and shows the object the vision PC finds. |
+| View | 3D, Top, Front, and **Camera**, which looks through the wrist camera. |
+
+**Safety**
+
+- **Arming:** nothing moves until **Arm** is switched on. Arming needs the
+  robot enabled and idle, a table height, and the model check: GetPose
+  must agree with the FK of GetAngle within 3 mm.
+- **STOP:** STOP (or Esc) sends Stop() and disarms.
+- **Every target is checked:**
+  - joint limits
+  - the whole path above the table: the joint path for MovJ, and IK every
+    5 mm on one branch for MovL
+  - the speed cap
+  - only one motion at a time
+- **Automatic disarm:** drag mode, an alarm, a collision or a lost
+  connection disarms the app. When the last browser closes or reloads the
+  page, a running move is stopped.
+- **Network access:** by default the server only listens on this PC
+  (127.0.0.1). `--host 0.0.0.0` opens it to the network, and then anyone
+  who opens the page can move the robot.
+- **Simulation:** the fingers only close on the object if the tool tip
+  really is at it. A pick that misses goes back up and home, as on the
+  robot.
+
+**Model:**
+- **Arm:** the URDF chain the browser draws matches `manipulator_kinematics`
+  within 0.016 mm, which `test_digital_twin.py` checks.
+- **Gripper:** there is no CAD of your gripper, so the twin draws a simple
+  parallel gripper at your 197 mm tool length. The camera box sits where the
+  camera table mounts it.
+- **Offline use:** three.js 0.160 (MIT) is in `twin_web/vendor`, so the
+  cell PC needs no internet. The browser needs WebGL.
 
 ## Real-time pick on the robot
 
@@ -497,8 +570,10 @@ and by the pendant reading above.
 
 ## Tests of the real-time side
 
-`test_pick_runner.py` and `test_vision_mqtt.py` need no robot, gripper,
-camera, GPU or broker. I mutation-tested them: I injected one bug at a
+`test_pick_runner.py`, `test_vision_mqtt.py` and `test_digital_twin.py`
+need no robot, gripper, camera, GPU or broker. The browser part of
+`test_digital_twin.py` runs when Playwright is installed
+(`pip install playwright`) and is skipped otherwise. I mutation-tested them: I injected one bug at a
 time, each on its own copy, and checked whether the tests failed.
 
 - **`test_pick_runner.py` caught 21 of 22.** Caught:

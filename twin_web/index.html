@@ -1,0 +1,116 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Nova 2 Digital Twin</title>
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Cpath d='M6 28h10v-4H6zM9 24l4-10 10-4 3 6' fill='none' stroke='%234f8cff' stroke-width='3' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E">
+  <link rel="stylesheet" href="web/style.css">
+  <script type="importmap">{ "imports": { "three": "./web/vendor/three/three.module.min.js" } }</script>
+  <script type="module" src="web/app.js"></script>
+</head>
+<body>
+  <header>
+    <div class="brand">Nova 2 <span>digital twin</span></div>
+    <div id="source" class="badge">connecting…</div>
+    <div id="mode" class="badge">—</div>
+    <div id="link" class="muted small">—</div>
+    <div class="spacer"></div>
+    <label class="arm"><input type="checkbox" id="arm"> <span>Arm</span></label>
+    <button id="stop" class="stop" title="Stop the robot now (Esc)">STOP</button>
+  </header>
+  <div id="armed-banner" hidden>ARMED: this app moves the robot. STOP or Esc halts it.</div>
+
+  <main>
+    <div id="view">
+      <div id="hud">
+        <div id="task" class="muted">idle</div>
+        <div id="pick-hint" hidden></div>
+      </div>
+      <div id="view-tools">
+        <button data-view="iso" title="Isometric view">3D</button>
+        <button data-view="top" title="From above">Top</button>
+        <button data-view="front" title="From the front">Front</button>
+        <button id="follow-cam" title="Watch through the wrist camera">Camera</button>
+      </div>
+    </div>
+
+    <aside id="panel">
+      <details open>
+        <summary>Robot</summary>
+        <div class="row"><span class="muted">State</span><span id="robot-state">—</span></div>
+        <div class="row"><span class="muted">Model vs controller</span><span id="model-check">—</span></div>
+        <div class="buttons">
+          <button id="enable">Enable</button>
+          <button id="disable">Disable</button>
+          <button id="clear-error">Clear alarm</button>
+          <button id="drag" title="Move the arm by hand; the twin follows">Drag mode</button>
+        </div>
+        <label class="row">Speed <input type="range" id="speed" min="1" max="50" value="20"> <output id="speed-out">20 %</output></label>
+      </details>
+
+      <details open>
+        <summary>Joints <span class="muted small">(deg, as the controller reports)</span></summary>
+        <div id="joints"></div>
+        <div class="buttons">
+          <label class="small">step <select id="jog-step"><option>1</option><option selected>5</option><option>10</option></select>°</label>
+          <button id="joints-reset" title="Sliders back to the robot's joints">Reset</button>
+          <button id="joints-move" class="primary">Move joints</button>
+        </div>
+      </details>
+
+      <details open>
+        <summary>Tool tip <span class="muted small">(base frame)</span></summary>
+        <div class="row"><span class="muted">FK</span><span id="tool-xyz" class="mono">—</span></div>
+        <div class="row"><span class="muted" title="ToolVectorActual: the controller's own TCP, for the tool selected on the pendant (tool 0 = flange)">Controller TCP</span><span id="tcp-xyz" class="mono">—</span></div>
+        <div class="jog">
+          <span class="muted small">jog</span>
+          <button data-jog="x-">−X</button><button data-jog="x+">+X</button>
+          <button data-jog="y-">−Y</button><button data-jog="y+">+Y</button>
+          <button data-jog="z-">−Z</button><button data-jog="z+">+Z</button>
+          <select id="jog-mm"><option>1</option><option selected>10</option><option>50</option></select><span class="small">mm</span>
+        </div>
+        <div class="buttons">
+          <button id="target-toggle" title="Drag a tool target in the 3D view">Target</button>
+          <button id="target-mode" title="Move or turn the target (T / R)" disabled>Turn</button>
+          <button id="target-joint" class="primary" disabled>Move (joint)</button>
+          <button id="target-line" disabled>Move (line)</button>
+          <button id="home">Home</button>
+        </div>
+      </details>
+
+      <details open>
+        <summary>Gripper</summary>
+        <div class="row"><span class="muted">State</span><span id="grip-state">—</span></div>
+        <div class="buttons">
+          <button id="grip-open">Open</button>
+          <button id="grip-close">Close</button>
+        </div>
+      </details>
+
+      <details open>
+        <summary>Pick &amp; place</summary>
+        <div class="row"><span class="muted">Object</span><span id="obj-state" class="mono">—</span></div>
+        <div class="row"><span class="muted">Place</span><span id="place-state" class="mono">—</span></div>
+        <div class="buttons">
+          <button id="set-object" title="Then click on the table">Set object</button>
+          <button id="set-place" title="Then click on the table">Set place</button>
+          <label class="small">Ø <input type="number" id="diameter" value="60" min="10" max="200" step="5"> mm</label>
+          <button id="detect" title="Home, then ask the vision PC (MQTT)">Detect</button>
+        </div>
+        <div class="buttons">
+          <button id="plan">Plan</button>
+          <button id="pick" class="primary">Pick &amp; place</button>
+          <button id="clear-plan">Clear</button>
+        </div>
+      </details>
+
+      <details open>
+        <summary>Log</summary>
+        <ol id="log"></ol>
+      </details>
+    </aside>
+  </main>
+  <div id="toast" hidden></div>
+</body>
+</html>

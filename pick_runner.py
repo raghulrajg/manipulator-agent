@@ -150,11 +150,14 @@ class PickRunner:
         self.joint_tol_deg, self.reach_tol_mm, self.model_tol_mm = joint_tol_deg, reach_tol_mm, model_tol_mm
         self.pose_timeout = pose_timeout
         self.log = log
+        self.on_status = None      # optional callback(state, detail), e.g. the digital twin
         self.request_id = None
         self.pose_queue = link.subscribe(POSE_TOPIC)
 
     def status(self, state, detail=""):
         self.log(f"[{state}] {detail}".rstrip())
+        if self.on_status:
+            self.on_status(state, detail)
         self.link.publish(STATUS_TOPIC, {"request_id": self.request_id, "state": state,
                                          "detail": detail, "stamp": time.time()})
 
@@ -260,7 +263,11 @@ class PickRunner:
         msg = self.wait_pose(q_detect)
         if np.abs(self.robot.get_angle() - q_detect).max() > 0.05:
             raise DobotError("the arm moved while the camera was looking")
+        return self.pick(msg, q_detect)
 
+    def plan(self, msg, q_detect, place_xy=None):
+        """Plan the pick (and place) for a pose message seen from q_detect,
+        without moving. Returns (PickPlan, [Move], T_base_object, table_z)."""
         T_camera_object = msg["T_camera_object"]
         T_base_object = fk(joint_map.servo_to_visual(q_detect), "camera") @ T_camera_object
         table_z = self.table_z if self.table_z is not None else table_from_message(msg, T_base_object)
@@ -271,14 +278,26 @@ class PickRunner:
             options["grasp_yaw_offset_deg"] = options.get("grasp_yaw_offset_deg", 0.0) + math.degrees(
                 _yaw(fk(joint_map.servo_to_visual(q_detect), "tool")) - _yaw(T_base_object))
         agent = ManipulatorAgent(table_z=table_z, **options)
-        plan, moves = plan_moves(agent, T_camera_object, q_detect, self.home, self.place_xy)
+        plan, moves = plan_moves(agent, T_camera_object, q_detect, self.home, place_xy)
+        return plan, moves, T_base_object, table_z
+
+    def pick(self, msg, q_detect, place_xy=False):
+        """Plan and carry out the pick for a pose message seen from q_detect
+        (place_xy: default the runner's own). Returns the PickPlan."""
+        place_xy = self.place_xy if place_xy is False else place_xy
+        plan, moves, T_base_object, table_z = self.plan(msg, q_detect, place_xy)
         self.log(f"object {msg.get('object', '')} at {np.round(T_base_object[:3, 3], 4).tolist()} m "
                  f"(base frame), table z {table_z:.4f} m")
         for m in moves:
             self.log(f"  {m.name:<9} {m.kind}  servo deg {np.round(m.q, 2).tolist()}  "
                      f"tool tip {np.round(m.T_tool[:3, 3], 4).tolist()}" + (f"  then {m.then}" if m.then else ""))
-
         self.status("picking", f"object at {np.round(T_base_object[:3, 3], 4).tolist()}")
+        self.execute(moves, place_xy)
+        return plan
+
+    def execute(self, moves, place_xy=None):
+        """Carry out planned moves: at each gripper step measure, then grip
+        or release. A missed grip opens, goes back up and home (PickFailed)."""
         by_name = {m.name: m for m in moves}
         for m in moves:
             self.move(m)
@@ -295,9 +314,8 @@ class PickRunner:
             elif m.then == "open":
                 self.at_target(m)
                 self.gripper.open()
-                self.status("placed", f"at {np.round(self.place_xy, 4).tolist()}")
-        self.status("done", "holding the object at home" if self.place_xy is None else "")
-        return plan
+                self.status("placed", f"at {np.round(place_xy, 4).tolist()}" if place_xy is not None else "")
+        self.status("done", "holding the object at home" if place_xy is None else "")
 
 
 def start_fake_vision(bus, T_camera_object, diameter=0.06, delay=0.2):

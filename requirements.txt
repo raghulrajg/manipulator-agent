@@ -2,3 +2,4 @@ numpy>=1.20
 matplotlib>=3.5   # simulate_pick.py only (.mp4 output also needs the ffmpeg program)
 paho-mqtt>=1.6    # pick_runner.py, foundationpose_mqtt.py (MQTT)
 pyserial>=3.4     # gripper.py (scservo_sdk)
+aiohttp>=3.9      # digital_twin.py (web server)
