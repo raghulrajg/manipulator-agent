@@ -44,7 +44,7 @@ import xml.etree.ElementTree as ET
 from collections import deque
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
-from urllib.parse import urlsplit
+from urllib.parse import quote, urlsplit
 
 import numpy as np
 
@@ -56,7 +56,7 @@ from manipulator_kinematics import (
     joint_map, pose, rot_z,
 )
 from mqtt_link import LocalBus, MessageError
-from pick_runner import PickFailed, PickRunner, start_fake_vision
+from pick_runner import PickFailed, PickRunner, measured_flange, start_fake_vision
 
 WEB = Path(__file__).resolve().parent / "twin_web"
 URDF = WEB / "model" / "nova2" / "nova2_robot.urdf"
@@ -199,9 +199,17 @@ class GuardedRobot:
     def _send(self, send, servo_deg, v, a):
         with self._twin.motion_lock:
             self._twin.gate()
+            self._twin.in_motion = True
             cmd_id = send(servo_deg, v, a)
             self._twin.moved = True
         return cmd_id
+
+    def _wait(self, cmd_id, reached, timeout, what):
+        try:
+            return self._robot.wait_motion(cmd_id, reached, timeout, what)
+        finally:
+            self._twin.in_motion = False
+            self._twin.motion_ended = time.monotonic()
 
     def mov_j(self, servo_deg, v=20, a=20):
         return self._send(self._robot.mov_j, servo_deg, v, a)
@@ -212,11 +220,11 @@ class GuardedRobot:
     def move_j(self, servo_deg, v=20, a=20, tol_deg=0.3, timeout=60.0, what="MovJ"):
         target = np.asarray(servo_deg, dtype=float)
         cmd_id = self.mov_j(target, v, a)
-        return self._robot.wait_motion(cmd_id, lambda q: np.abs(q - target).max() <= tol_deg, timeout, what)
+        return self._wait(cmd_id, lambda q: np.abs(q - target).max() <= tol_deg, timeout, what)
 
     def move_l(self, servo_deg, reached, v=10, a=10, timeout=60.0, what="MovL"):
         cmd_id = self.mov_l(servo_deg, v, a)
-        return self._robot.wait_motion(cmd_id, reached, timeout, what)
+        return self._wait(cmd_id, reached, timeout, what)
 
 
 class TwinGripper:
@@ -275,6 +283,10 @@ class Twin:
         self.task = self.step = None
         self.cancel = threading.Event()      # STOP latch, cleared only by Arm
         self.moved = False                   # the running task has sent a motion
+        self.in_motion = False               # a MovJ/MovL of ours is on its way or running
+        self.motion_ended = -math.inf
+        self.stop_gen = 0                    # +1 at every STOP / disarm
+        self._ctx = threading.local()        # the stop_gen a command was received under
         self.model_error_mm = None
         self.object = None          # {"T": 4x4, "diameter", "attached", "T_tool_obj", "source"}
         self.object_diameter = object_diameter
@@ -291,6 +303,7 @@ class Twin:
         self.gripper = TwinGripper(gripper, self)
         try:
             self.grip["position"] = int(self.gripper.position())
+            self.grip["holding"] = 10 < self.grip["position"] < 245   # unknown: treat as holding
         except (GripperError, OSError) as e:
             self.log(f"gripper position unknown: {e}", "warn")
         self.runner = PickRunner(self.guarded, self.gripper, self.link, home=self.home, table_z=table_z,
@@ -372,6 +385,11 @@ class Twin:
         self.cancel.set()
         with self.lock:
             self.armed = False
+            self.stop_gen += 1
+
+    def _sent_before_stop(self):
+        gen = getattr(self._ctx, "gen", None)
+        return gen is not None and gen != self.stop_gen
 
     def _send_stop(self):
         """Stop() after any move already through the gate; reconnect once
@@ -401,11 +419,21 @@ class Twin:
         alarm, collision, paused, drag mode, moving without the app, or
         silent; stop a task no browser is watching any more."""
         since = {}
+        q_ref = None
         while True:
             time.sleep(0.05)
+            try:
+                q_ref = self._watch_once(since, q_ref)
+            except Exception as e:   # the watcher must not die: fail safe
+                since.clear()
+                q_ref = None
+                if self.armed:
+                    self._abort(f"watcher error {type(e).__name__}: {e}")
+
+    def _watch_once(self, since, q_ref):
             if not self.armed:
                 since.clear()
-                continue
+                return None
             why = None
             s, age = self.feedback.latest(), self.feedback.age()
             heard = self.clients_heard() if self.clients_heard else 0.0
@@ -421,20 +449,29 @@ class Twin:
                 why = "the robot was paused"
             elif s["robot_mode"] == 8:
                 why = "someone is jogging the robot"
-            elif s["robot_mode"] == 7 and self.task is None:
+            elif s["robot_mode"] == 7 and not self.in_motion and time.monotonic() - self.motion_ended > 0.3:   # feedback lags our own end
                 why = "the robot is moving, but not for this app"
             elif self.task is not None and heard > CLIENT_SILENT:
-                why = f"no browser heard from for {heard:.0f} s"
+                why = "no browser heard from"
+            immediate = why is not None and why != "no feedback from the robot" and why != "no browser heard from"
+            if s is not None and age <= FEEDBACK_STALE:
+                q = np.asarray(s["q_actual"], dtype=float)
+                if self.in_motion or q_ref is None or time.monotonic() - self.motion_ended < 0.3:
+                    q_ref = q
+                elif why is None and np.abs(q - q_ref).max() > 0.1:
+                    why, immediate = "the robot was moved, but not by this app", True
             now = time.monotonic()
             for key in list(since):
                 if key != why:
                     del since[key]
             if why is None:
-                continue
+                return q_ref
             since.setdefault(why, now)
-            if now - since[why] >= DISARM_AFTER:
-                self._abort(why)
+            if immediate or now - since[why] >= DISARM_AFTER:
+                self._abort(why if why != "no browser heard from" else f"no browser heard from for {heard:.1f} s")
                 since.clear()
+                return None
+            return q_ref
 
     # ------------------------------------------------------------ checks
     def _joints_now(self):
@@ -536,6 +573,8 @@ class Twin:
                 raise TwinError(f"busy: {self.task}")
             if not self.armed or self.cancel.is_set():
                 raise TwinError("not armed: switch on 'Arm' to let the app move the robot")
+            if self._sent_before_stop():
+                raise TwinError("STOP was pressed after this command was sent: not run")
             self.task, self.step = name, None
         self._tasks.put((name, fn, q_from))
         return {"queued": name}
@@ -621,9 +660,10 @@ class Twin:
         return view
 
     # ------------------------------------------------------------ commands
-    def handle(self, cmd):
+    def handle(self, cmd, gen=None):
         """One command from a browser -> reply dict. Motions are queued; the
         reply says whether they were accepted, the state shows the rest."""
+        self._ctx.gen = gen
         try:
             if not isinstance(cmd, dict):
                 raise TwinError("a command is a JSON object")
@@ -646,11 +686,7 @@ class Twin:
 
     def cmd_arm(self, on=True):
         if not _bool(on, "on"):
-            if self.task is not None:
-                return self.cmd_stop()   # taking the permission away stops what it allowed
-            self.request_stop()
-            self.log("disarmed")
-            return {}
+            return self.cmd_stop()   # taking the permission away stops what it allowed (no check-then-act)
         if not self.robot_state()["connected"]:
             raise TwinError("no feedback from the robot")
         if not self.robot.connected:
@@ -667,6 +703,8 @@ class Twin:
         with self.lock:
             if self.task is not None:
                 raise TwinError(f"busy: {self.task}")
+            if self._sent_before_stop():
+                raise TwinError("STOP was pressed after this Arm was sent: Arm again")
             self.cancel.clear()
             self.armed = True
         self.log("armed: the app may move the robot", "warn")
@@ -730,10 +768,12 @@ class Twin:
 
     def check_model(self):
         q = self.robot.get_angle()
-        measured = self.robot.get_pose()[:3] / 1000
+        measured, frame = measured_flange(self.robot, q)
         model = fk(joint_map.servo_to_visual(q), "flange")[:3, 3]
         self.model_error_mm = float(np.linalg.norm(measured - model) * 1000)
-        self.log(f"model check: controller vs FK {self.model_error_mm:.2f} mm",
+        self.log(f"model check: controller ({frame}) vs FK {self.model_error_mm:.2f} mm"
+                 + ("" if self.model_error_mm <= 3.0 else
+                    " -- on the pendant select tool 0 (flange) or the 197 mm tool, then Enable again"),
                  "info" if self.model_error_mm <= 3.0 else "error")
         return self.model_error_mm
 
@@ -909,6 +949,7 @@ def make_app(twin, model, config, token):
     from aiohttp import WSMsgType, web
 
     clients = {}                                        # ws -> {"seq": last log sent, "heard": monotonic}
+    last_heard = [-math.inf]                            # any browser, monotonic (one float: no dict walk off-loop)
     instance = secrets.token_hex(4)                     # a restarted server starts its log afresh
     work = ThreadPoolExecutor(4, thread_name_prefix="twin-cmd")     # ordinary commands
     stops = ThreadPoolExecutor(1, thread_name_prefix="twin-stop")   # STOP never waits behind them
@@ -916,7 +957,7 @@ def make_app(twin, model, config, token):
     def heard():
         if not clients:
             return math.inf
-        return time.monotonic() - max(c["heard"] for c in clients.values())
+        return time.monotonic() - last_heard[0]
     twin.clients_heard = heard
 
     async def index(request):
@@ -929,7 +970,7 @@ def make_app(twin, model, config, token):
         origin = request.headers.get("Origin")
         if origin is not None and urlsplit(origin).netloc != request.host:
             return False
-        return secrets.compare_digest(request.query.get("token", ""), token)
+        return secrets.compare_digest(request.query.get("token", "").encode(), token.encode())
 
     async def stop_now(loop):
         twin.request_stop()                        # latched at once, on the event loop
@@ -944,27 +985,36 @@ def make_app(twin, model, config, token):
             return ws
         loop = asyncio.get_running_loop()
         clients[ws] = {"seq": 0, "heard": time.monotonic()}
+        last_heard[0] = time.monotonic()
         inbox = asyncio.Queue()
         await ws.send_json({"type": "hello", "model": model, "config": config, "log_seq": twin._log_seq,
                             "instance": instance})
 
         async def reply(cmd, result):
+            cid = cmd.get("id")
+            if not (isinstance(cid, str) and len(cid) <= 64 or isinstance(cid, int) and not isinstance(cid, bool)
+                    and abs(cid) < 2 ** 53):
+                cid = None
+            name = cmd.get("cmd") if isinstance(cmd.get("cmd"), str) else None
             if not ws.closed:
-                await ws.send_json({"type": "reply", "id": cmd.get("id"), "cmd": cmd.get("cmd"), **result},
+                await ws.send_json({"type": "reply", "id": cid, "cmd": name, **result},
                                    dumps=lambda o: json.dumps(o, allow_nan=False, default=str))
 
         async def run_commands():   # this browser's commands, one at a time
             while True:
-                cmd = await inbox.get()
-                result = await loop.run_in_executor(work, twin.handle, cmd)
-                await reply(cmd, result)
+                cmd, gen = await inbox.get()
+                result = await loop.run_in_executor(work, twin.handle, cmd, gen)
+                try:
+                    await reply(cmd, result)
+                except (ValueError, TypeError) as e:   # never lose this browser's later commands
+                    await reply(cmd, {"ok": False, "error": f"reply not sent: {e}"})
 
         runner = asyncio.create_task(run_commands())
         try:
             async for msg in ws:
                 if msg.type != WSMsgType.TEXT:
                     continue
-                clients[ws]["heard"] = time.monotonic()
+                clients[ws]["heard"] = last_heard[0] = time.monotonic()
                 try:
                     cmd = json.loads(msg.data, parse_constant=_no_constants)
                     if not isinstance(cmd, dict):
@@ -976,10 +1026,10 @@ def make_app(twin, model, config, token):
                     continue
                 if cmd.get("cmd") == "stop":
                     await reply(cmd, {"ok": True, **await stop_now(loop)})
-                elif cmd.get("cmd") == "arm" and cmd.get("on") is False and twin.task is not None:
+                elif cmd.get("cmd") == "arm" and cmd.get("on") is False:
                     await reply(cmd, {"ok": True, **await stop_now(loop)})
                 else:
-                    inbox.put_nowait(cmd)
+                    inbox.put_nowait((cmd, twin.stop_gen))
         finally:
             runner.cancel()
             clients.pop(ws, None)
@@ -1137,9 +1187,9 @@ def main():
     token = args.token or secrets.token_urlsafe(12)
     twin, config, cleanup = build(args)
     app = make_app(twin, load_model(), config, token)
-    host = "localhost" if args.host in ("127.0.0.1", "0.0.0.0") else args.host
+    host = "localhost" if args.host in ("127.0.0.1", "0.0.0.0", "::") else f"[{args.host}]" if ":" in args.host else args.host
     print(f"digital twin ({'simulated robot' if args.sim else 'robot ' + args.robot}): "
-          f"open http://{host}:{args.port}/?token={token}")
+          f"open http://{host}:{args.port}/?token={quote(token, safe='')}")
     try:
         web.run_app(app, host=args.host, port=args.port, print=None)
     finally:

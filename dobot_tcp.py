@@ -96,6 +96,9 @@ class DobotTCP:
         self._lock = threading.Lock()
         self._has_command_id = True
         self.stops = 0      # Stop() calls so far: a move being waited for ends at the next one
+        self._pose_args = True
+        self.pose_tool = 0  # what get_pose() reports: 0 = flange, None = the tool selected on the pendant
+        self._stops_at_send = {}   # cmd_id -> self.stops when that move was sent
 
     # ------------------------------------------------------------ connection
     def connect(self):
@@ -193,8 +196,21 @@ class DobotTCP:
         return self._numbers("GetAngle()", 6)
 
     def get_pose(self):
-        """Flange (tool 0) in the base frame (user 0): x y z [mm], rx ry rz [deg]."""
-        return self._numbers("GetPose(user=0,tool=0)", 6)
+        """x y z [mm], rx ry rz [deg] in the base frame. Asks for the flange
+        (user 0, tool 0); firmware that refuses those arguments (ErrorID
+        -40001 and the like) gets plain GetPose(): the pose of the tool
+        selected on the pendant, and pose_tool becomes None."""
+        if self._pose_args:
+            try:
+                values = self._numbers("GetPose(user=0,tool=0)", 6)
+                self.pose_tool = 0
+                return values
+            except DobotError as e:
+                if e.error_id is None or e.error_id > -20000:   # not a parameter error
+                    raise
+                self._pose_args = False
+        self.pose_tool = None
+        return self._numbers("GetPose()", 6)
 
     def current_command_id(self):
         """Queue ID of the motion command running now; None if this
@@ -228,12 +244,18 @@ class DobotTCP:
     # ------------------------------------------------------------ motion
     def mov_j(self, servo_deg, v=20, a=20):
         """Queue a joint move, return its queue ID (does not wait)."""
-        return int(float(self.send(f"MovJ({_joints_arg(servo_deg)},a={int(a)},v={int(v)})")))
+        stops = self.stops
+        cmd_id = int(float(self.send(f"MovJ({_joints_arg(servo_deg)},a={int(a)},v={int(v)})")))
+        self._stops_at_send[cmd_id] = stops
+        return cmd_id
 
     def mov_l(self, servo_deg, v=10, a=10):
         """Queue a straight-line move to the pose of these joints, return its
         queue ID (does not wait)."""
-        return int(float(self.send(f"MovL({_joints_arg(servo_deg)},a={int(a)},v={int(v)})")))
+        stops = self.stops
+        cmd_id = int(float(self.send(f"MovL({_joints_arg(servo_deg)},a={int(a)},v={int(v)})")))
+        self._stops_at_send[cmd_id] = stops
+        return cmd_id
 
     def wait_motion(self, cmd_id, reached, timeout=60.0, what="move", max_wait=1800.0):
         """
@@ -248,7 +270,7 @@ class DobotTCP:
         t0 = t_moved = time.monotonic()
         q_moved = None
         stopped_since = None
-        stops = self.stops
+        stops = self._stops_at_send.pop(cmd_id, self.stops)
         started = False      # seen running, or past this command's ID
         while True:
             if self.stops != stops:
@@ -312,7 +334,8 @@ def main():
         model = fk(joint_map.servo_to_visual(q), "flange")[:3, 3] * 1000
         print(f"RobotMode   {mode} ({MODE_NAMES.get(mode, '?')})")
         print(f"GetAngle    {q} deg")
-        print(f"GetPose     {p[:3]} mm, rx ry rz {p[3:]} deg (flange, tool 0)")
+        print(f"GetPose     {p[:3]} mm, rx ry rz {p[3:]} deg "
+              f"({'flange, tool 0' if robot.pose_tool == 0 else 'the tool selected on the pendant'})")
         print(f"model FK    {model} mm  -> differs by {np.linalg.norm(model - p[:3]):.2f} mm")
         print(f"GetErrorID  {robot.error_ids()}")
 

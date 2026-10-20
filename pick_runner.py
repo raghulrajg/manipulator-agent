@@ -79,6 +79,21 @@ class Move:
     then: Optional[str] = None   # "close" / "open" the gripper once there
 
 
+def measured_flange(robot, servo_deg):
+    """The controller's own flange position [m] (GetPose) and what it was
+    read as. Without tool arguments GetPose reports the pendant's tool:
+    the flange (tool 0) or the 197 mm tool tip (x-trainer's tool 1) are
+    recognised by whichever the model puts closer."""
+    p = robot.get_pose()[:3] / 1000
+    if getattr(robot, "pose_tool", 0) == 0:
+        return p, "flange"
+    q = joint_map.servo_to_visual(servo_deg)
+    flange, tip = fk(q, "flange")[:3, 3], fk(q, "tool")[:3, 3]
+    if np.linalg.norm(p - tip) < np.linalg.norm(p - flange):
+        return p - (tip - flange), "tool tip (pendant tool)"
+    return p, "flange (pendant tool 0)"
+
+
 def tool_error(servo_deg, T_target):
     """(position error [m], rotation error [deg]) of the tool tip at these
     joints against T_target."""
@@ -167,7 +182,7 @@ class PickRunner:
         """The controller's flange position (GetPose, tool 0) must match the
         FK of its joints, or the IK would send the arm somewhere else."""
         q = self.robot.get_angle()
-        measured = self.robot.get_pose()[:3] / 1000
+        measured, _ = measured_flange(self.robot, q)
         model = fk(joint_map.servo_to_visual(q), "flange")[:3, 3]
         err = np.linalg.norm(measured - model) * 1000
         self.log(f"model check: GetPose {np.round(measured * 1000, 1).tolist()} mm, "
@@ -182,7 +197,7 @@ class PickRunner:
         q = self.robot.get_angle()
         dp, dang = tool_error(q, move.T_tool)
         flange = (move.T_tool @ np.linalg.inv(T_FLANGE_TOOL))[:3, 3]
-        dctrl = np.linalg.norm(self.robot.get_pose()[:3] / 1000 - flange) * 1000
+        dctrl = np.linalg.norm(measured_flange(self.robot, q)[0] - flange) * 1000
         self.log(f"at {move.name}: tool tip {dp * 1000:.2f} mm / {dang:.2f} deg from the target, "
                  f"controller flange {dctrl:.2f} mm")
         if dp * 1000 > self.reach_tol_mm or dang > ROT_TOL_DEG or dctrl > self.reach_tol_mm + self.model_tol_mm:
@@ -232,14 +247,14 @@ class PickRunner:
         self.link.publish(READY_TOPIC, ready_message(self.request_id, joints))
         self.status("waiting", f"ready sent on {READY_TOPIC}, waiting for {POSE_TOPIC}")
         while True:
+            now = time.monotonic()   # checked on every message too: a stream of other answers must not hide STOP
+            if self.cancel is not None and self.cancel.is_set():
+                raise PickFailed("stopped while waiting for the vision")
+            if self.pose_timeout and now - t0 > self.pose_timeout:
+                raise PickFailed(f"no object pose after {self.pose_timeout:.0f} s")
             try:
                 payload = self.pose_queue.get(timeout=0.2)
             except queue.Empty:
-                now = time.monotonic()
-                if self.cancel is not None and self.cancel.is_set():
-                    raise PickFailed("stopped while waiting for the vision")
-                if self.pose_timeout and now - t0 > self.pose_timeout:
-                    raise PickFailed(f"no object pose after {self.pose_timeout:.0f} s")
                 if now - sent > READY_REPEAT_S:
                     self.link.publish(READY_TOPIC, ready_message(self.request_id, joints))
                     sent = now

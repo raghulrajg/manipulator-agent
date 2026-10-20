@@ -107,6 +107,11 @@ included, can move the robot.
 
 **Safety**
 
+- **Firmware without GetPose arguments:** some V4 firmware refuses
+  `GetPose(user=0,tool=0)` with ErrorID -40001. The model check then uses
+  plain `GetPose()`, which reports the tool selected on the pendant. It
+  accepts tool 0 (the flange) or the 197 mm tool (x-trainer's tool 1); any
+  other tool makes arming refuse, with a message saying so.
 - **Arming:** nothing moves until **Arm** is switched on. Arming needs the
   robot enabled and idle, a table height, and the model check: GetPose
   must agree with the FK of GetAngle within 3 mm.
@@ -257,7 +262,8 @@ the arm is waiting. An invalid ready message is logged and skipped.
 
 ```
 python3 dobot_tcp.py --ip 192.168.5.1               # read only: mode, joints, pose, model check, alarms
-python3 gripper.py --arm left                       # open, close, open once; says if it holds something
+python3 gripper.py --arm left open                  # just open it (or: close)
+python3 gripper.py --arm left                       # test: open, close, open; says if it holds something
 python3 pick_runner.py --dry-run --fake-vision demo # fake robot, gripper and vision
 python3 pick_runner.py --dry-run                    # fake robot and gripper, your broker and vision PC
 python3 pick_runner.py --table-z -0.05 --speed 10   # first real pick: slow; holds it at home, ends

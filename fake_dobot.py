@@ -54,7 +54,12 @@ def _smooth(s):
 
 class FakeDobot:
     def __init__(self, joints=None, deg_per_s=NOVA2_DEG_PER_S, command_id=True, fault=None,
-                 feedback=True, enabled=False):
+                 feedback=True, enabled=False, pose_args=True, pendant_tool=None):
+        """pose_args=False: GetPose(user=..,tool=..) is refused with -40001, as
+        on some V4 firmware. pendant_tool: a 4x4 flange->tool transform for
+        the tool selected on the pendant (None = tool 0, the flange)."""
+        self.pose_args = pose_args
+        self.pendant_tool = np.eye(4) if pendant_tool is None else np.asarray(pendant_tool, dtype=float)
         self.joints = np.array(joint_map.home_servo_deg if joints is None else joints, dtype=float)
         self.target = self.joints.copy()
         self.deg_per_s = deg_per_s
@@ -200,7 +205,11 @@ class FakeDobot:
         if name == "GetAngle":
             return 0, ",".join(f"{a:.4f}" for a in self.joints)
         if name == "GetPose":
+            if args.strip() and not self.pose_args:
+                return -40001, ""
             T = fk(joint_map.servo_to_visual(self.joints), "flange")
+            if not args.strip():
+                T = T @ self.pendant_tool
             return 0, ",".join(f"{v:.4f}" for v in [*(T[:3, 3] * 1000), *euler_xyz_deg(T[:3, :3])])
         if name == "GetErrorID":
             alarm = "[22]" if self.mode == 11 else "[]"

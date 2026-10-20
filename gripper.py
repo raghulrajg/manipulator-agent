@@ -18,7 +18,9 @@ whether they stopped on something: fingers that end up (nearly) fully
 closed had nothing between them.
 
 Run (opens and closes the gripper once):
-    python3 gripper.py --arm left            # ID 21 on /dev/ttyUSB1
+    python3 gripper.py --arm left open       # ID 21 on /dev/ttyUSB1: open it
+    python3 gripper.py --arm left close
+    python3 gripper.py --arm left            # test: open, close, open
     python3 gripper.py --port /dev/ttyUSB0 --id 22
 """
 
@@ -184,7 +186,8 @@ class FakeGripper:
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Open and close the Feetech gripper once.")
+    parser = argparse.ArgumentParser(description="Open or close the Feetech gripper, or test it (open, close, open).")
+    parser.add_argument("action", nargs="?", choices=("open", "close", "test"), default="test")
     parser.add_argument("--arm", choices=("left", "right"), default="left",
                         help="left = ID 21 on /dev/ttyUSB1 (default), right = ID 22 on /dev/ttyUSB0")
     parser.add_argument("--port", help="override the arm's port")
@@ -197,12 +200,17 @@ def main():
                        torque_limit=args.torque)
     print(f"gripper: servo ID {g.servo_id} on {g.port}")
     try:
-        g.open()
-        print(f"open:  raw {g.read_raw()}")
-        r = g.close()
-        print(f"close: raw {r.raw} (position {r.position}/255), load {r.load}, "
-              f"{'holding something' if r.holding else 'nothing between the fingers'}")
-        g.open()
+        print(f"now:   raw {g.read_raw()} (position {g.from_raw(g.read_raw())}/255)")
+        if args.action in ("open", "test"):
+            g.open()
+            print(f"open:  raw {g.read_raw()}")
+        if args.action in ("close", "test"):
+            r = g.close()
+            print(f"close: raw {r.raw} (position {r.position}/255), load {r.load}, "
+                  f"{'holding something' if r.holding else 'nothing between the fingers'}")
+        if args.action == "test":
+            g.open()
+            print(f"open:  raw {g.read_raw()}")
     finally:
         g.disconnect()
 

@@ -623,6 +623,23 @@ def test_line_with_reading_noise():
     print("OK\n")
 
 
+def test_getpose_without_arguments():
+    print("=" * 60)
+    print("Firmware that refuses GetPose(user=0,tool=0) (ErrorID -40001)")
+    print("=" * 60)
+    from manipulator_kinematics import T_FLANGE_TOOL, pose
+    for tool, ok in ((None, True), (T_FLANGE_TOOL, True), (pose(np.eye(3), [0, 0, 0.05]), False)):
+        h = Harness(pose_args=False, pendant_tool=tool)
+        r = h.twin.handle({"cmd": "arm"})
+        assert r["ok"] == ok, (tool, r, h.lines[-2:])
+        if ok:
+            h.ok("pick")
+            h.idle(60)
+            assert any("at grasp" in line for line in h.lines) and h.twin.grip["holding"], h.lines[-4:]
+        h.close()
+    print("OK: arms and picks with the pendant on tool 0 or the 197 mm tool; refuses an unknown tool\n")
+
+
 # ============================================================
 # WEBSOCKET AND BROWSER
 # ============================================================
@@ -807,5 +824,6 @@ if __name__ == "__main__":
     test_detect_safeguards()
     test_gripper_states()
     test_line_with_reading_noise()
+    test_getpose_without_arguments()
     test_websocket()
     test_browser()

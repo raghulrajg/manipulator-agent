@@ -45,6 +45,7 @@ below the table (TableConstraint), and orders the rest nearest the current
 joint state first.
 """
 
+import itertools
 import math
 from dataclasses import dataclass
 from typing import List, Optional, Tuple
@@ -344,6 +345,12 @@ def to_servo_near(q, ref_servo_deg, limits=SERVO_LIMITS_DEG):
     return out
 
 
+# corners of the gripper as twin_web/app.js draws it, in the DH flange frame [m]
+_GRIPPER_BOXES = [((-0.0475, 0.0475), (-0.025, 0.025), (0.012, 0.097))] + \
+    [((s * 0.046 - 0.006, s * 0.046 + 0.006), (-0.015, 0.015), (0.097, 0.197)) for s in (-1, 1)]
+GRIPPER_CORNERS = [np.array([x, y, z, 1.0]) for b in _GRIPPER_BOXES for x, y, z in itertools.product(*b)]
+
+
 @dataclass
 class TableConstraint:
     """
@@ -385,6 +392,12 @@ class TableConstraint:
             ("gripper",   o[5], tip, self.tip_clearance),
         )
         too_low = {}
+        flange = cumulative[-1]
+        for c in GRIPPER_CORNERS:   # the gripper's body and open fingers, not just its axis
+            p = (flange @ c)[:3]
+            short = self.z + self.tip_clearance - p[2]
+            if short > 1e-9 and self._over_table(p):
+                too_low["gripper"] = max(too_low.get("gripper", 0.0), short)
         for name, start, end, clearance in links:
             for t in np.linspace(0.0, 1.0, 5):
                 p = start + t * (end - start)
