@@ -151,6 +151,7 @@ class PickRunner:
         self.pose_timeout = pose_timeout
         self.log = log
         self.on_status = None      # optional callback(state, detail), e.g. the digital twin
+        self.cancel = None         # optional threading.Event: set = stop waiting for the vision
         self.request_id = None
         self.pose_queue = link.subscribe(POSE_TOPIC)
 
@@ -235,6 +236,8 @@ class PickRunner:
                 payload = self.pose_queue.get(timeout=0.2)
             except queue.Empty:
                 now = time.monotonic()
+                if self.cancel is not None and self.cancel.is_set():
+                    raise PickFailed("stopped while waiting for the vision")
                 if self.pose_timeout and now - t0 > self.pose_timeout:
                     raise PickFailed(f"no object pose after {self.pose_timeout:.0f} s")
                 if now - sent > READY_REPEAT_S:

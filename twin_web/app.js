@@ -18,6 +18,8 @@ const toRows = (m) => {
 const mm = (v) => (v * 1000).toFixed(1);
 
 let ws = null, model = null, config = null, state = null, reqId = 0;
+let lastLogSeq = 0, toastAfterSeq = Infinity, lastStateAt = 0, builtTableZ = null, serverInstance = null;
+const TOKEN = new URLSearchParams(location.search).get('token') || '';
 const pending = new Map();
 let robot = null, ghost = null, sceneReady = false;
 let pickMode = null;              // 'object' | 'place' | null
@@ -36,7 +38,9 @@ renderer.shadowMap.enabled = true;
 view.appendChild(renderer.domElement);
 
 const scene = new THREE.Scene();
-scene.background = new THREE.Color(getComputedStyle(document.documentElement).getPropertyValue('--bg').trim() || '#0f141b');
+const themeBackground = () => new THREE.Color(getComputedStyle(document.documentElement).getPropertyValue('--bg').trim() || '#0f141b');
+scene.background = themeBackground();
+matchMedia('(prefers-color-scheme: light)').addEventListener('change', () => { scene.background = themeBackground(); });
 const camera = new THREE.PerspectiveCamera(45, 1, 0.01, 20);
 camera.up.set(0, 0, 1);
 camera.position.set(-1.1, -1.0, 0.85);
@@ -184,8 +188,15 @@ function buildRobot(isGhost) {
 }
 let robotMeshesLoaded = 0;
 
+function disposeTree(obj) {
+  obj.traverse((o) => {
+    if (o.geometry) o.geometry.dispose();
+    if (o.material) o.material.dispose();
+  });
+}
+
 function buildObject(diameter) {
-  if (world.objectMesh) scene.remove(world.objectMesh);
+  if (world.objectMesh) { scene.remove(world.objectMesh); disposeTree(world.objectMesh); }
   const g = new THREE.Group();
   g.matrixAutoUpdate = false;
   const r = diameter / 2;
@@ -241,11 +252,17 @@ function pushTrail(p) {
 }
 
 let planKey = '';
+const waypointGeometry = new THREE.SphereGeometry(0.007, 12, 8);
+const waypointMaterials = {
+  close: new THREE.MeshBasicMaterial({ color: 0xef5350 }),
+  open: new THREE.MeshBasicMaterial({ color: 0x3fbf7f }),
+  none: new THREE.MeshBasicMaterial({ color: 0xffd166 }),
+};
 function showPlan(plan) {
   const key = plan ? JSON.stringify(plan.path) : '';
   if (key === planKey) return;
   planKey = key;
-  if (world.path) { scene.remove(world.path); world.path.geometry.dispose(); world.path = null; }
+  if (world.path) { scene.remove(world.path); world.path.geometry.dispose(); world.path.material.dispose(); world.path = null; }
   world.waypoints.clear();
   if (!plan) return;
   const geo = new THREE.BufferGeometry().setFromPoints(plan.path.map((p) => new THREE.Vector3(...p)));
@@ -253,8 +270,7 @@ function showPlan(plan) {
   world.path.computeLineDistances();
   scene.add(world.path);
   for (const m of plan.moves) {
-    const color = m.then === 'close' ? 0xef5350 : m.then === 'open' ? 0x3fbf7f : 0xffd166;
-    const s = new THREE.Mesh(new THREE.SphereGeometry(0.007, 12, 8), new THREE.MeshBasicMaterial({ color }));
+    const s = new THREE.Mesh(waypointGeometry, waypointMaterials[m.then || 'none']);
     s.position.set(...m.xyz);
     world.waypoints.add(s);
   }
@@ -273,7 +289,8 @@ gizmo.addEventListener('objectChange', () => throttle('target', 120, previewTarg
 scene.add(gizmo);
 
 function buildScene() {
-  buildTable(config.table_z ?? 0);
+  builtTableZ = config.table_z ?? 0;
+  buildTable(builtTableZ);
   robot = buildRobot(false);
   ghost = buildRobot(true);
   ghost.root.visible = false;
@@ -287,11 +304,13 @@ function buildScene() {
 // SERVER LINK
 // ============================================================
 
+let denied = false;
 function connect() {
-  ws = new WebSocket(`${location.protocol === 'https:' ? 'wss' : 'ws'}://${location.host}/ws`);
+  ws = new WebSocket(`${location.protocol === 'https:' ? 'wss' : 'ws'}://${location.host}/ws?token=${encodeURIComponent(TOKEN)}`);
   ws.onmessage = (ev) => {
     const msg = JSON.parse(ev.data);
-    if (msg.type === 'hello') onHello(msg);
+    if (msg.type === 'denied') { denied = true; setBadge($('source'), 'access denied', 'm-bad'); toast(msg.error); }
+    else if (msg.type === 'hello') onHello(msg);
     else if (msg.type === 'state') onState(msg);
     else if (msg.type === 'log') onLog(msg.entries);
     else if (msg.type === 'reply') {
@@ -301,12 +320,44 @@ function connect() {
     }
   };
   ws.onclose = () => {
-    setBadge($('source'), 'disconnected', 'm-bad');
+    if (!denied) setBadge($('source'), 'disconnected', 'm-bad');
     for (const resolve of pending.values()) resolve({ ok: false, error: 'disconnected' });
     pending.clear();
-    setTimeout(connect, 1000);
+    markStale('no connection');
+    if (!denied) setTimeout(connect, 1000);
   };
 }
+
+// the server stops a running task when no browser has been heard from for 3 s
+setInterval(() => {
+  if (ws && ws.readyState === WebSocket.OPEN) ws.send('{"cmd":"keepalive"}');
+}, 500);
+
+// no state for a while: everything on screen is old -- say so, allow nothing
+function markStale(why) {
+  state = null;
+  setBadge($('mode'), why, 'm-bad');
+  $('link').textContent = '';
+  $('armed-banner').hidden = true;
+  $('arm').checked = false;
+  $('task').textContent = `${why}: the picture is not live`;
+  $('robot-state').textContent = why;
+  setDim(true);
+  refreshButtons();
+}
+function setDim(on) {   // a see-through robot = not the robot's current state
+  if (!robot || robot.dimmed === on) return;
+  robot.dimmed = on;
+  robot.root.traverse((o) => {
+    if (!o.material) return;
+    o.material.transparent = on;
+    o.material.opacity = on ? 0.3 : 1;
+    o.material.needsUpdate = true;
+  });
+}
+setInterval(() => {
+  if (state && performance.now() - lastStateAt > 600) markStale('no state from the server');
+}, 200);
 
 function send(cmd, args = {}) {
   return new Promise((resolve) => {
@@ -337,7 +388,17 @@ function throttle(key, ms, fn) {
 
 function onHello(msg) {
   model = msg.model;
+  if (sceneReady && msg.config.table_z !== builtTableZ) { location.reload(); return; }   // a different table
   config = msg.config;
+  toastAfterSeq = msg.log_seq;   // errors from before (re)connecting are not news
+  if (serverInstance !== null && msg.instance !== serverInstance) {
+    lastLogSeq = 0;              // a restarted server: its log starts again
+    const li = document.createElement('li');
+    li.className = 'warn';
+    li.textContent = '— server restarted —';
+    $('log').append(li);
+  }
+  serverInstance = msg.instance;
   if (!sceneReady) {
     buildScene();
     buildJointRows();
@@ -361,7 +422,9 @@ function setBadge(el, text, cls) {
 
 function onState(s) {
   state = s;
+  lastStateAt = performance.now();
   if (!sceneReady) return;
+  setDim(false);
   const r = s.robot;
   if (r.joints) {
     robot.setJoints(r.joints);
@@ -411,7 +474,7 @@ function onState(s) {
     r.joints.forEach((a, i) => {
       const row = jointRows[i];
       row.actual.textContent = `actual ${a.toFixed(2)}°`;
-      if (!edited[i]) { targets[i] = a; row.range.value = a; row.num.value = a.toFixed(2); }
+      if (!edited[i] && document.activeElement !== row.num) { targets[i] = a; row.range.value = a; row.num.value = a.toFixed(2); }
     });
     const T = r.tool;
     $('tool-xyz').textContent = `${mm(T[0][3])}, ${mm(T[1][3])}, ${mm(T[2][3])} mm`;
@@ -439,13 +502,15 @@ function refreshButtons() {
 function onLog(entries) {
   const ol = $('log');
   for (const e of entries) {
+    if (e.seq <= lastLogSeq) continue;   // already shown before a reconnect
+    lastLogSeq = e.seq;
     const li = document.createElement('li');
     li.className = e.level;
     const t = new Date(e.t * 1000);
     li.innerHTML = `<time>${t.toLocaleTimeString()}</time>`;
     li.append(document.createTextNode(e.text));
     ol.append(li);
-    if (e.level === 'error') toast(e.text);
+    if (e.level === 'error' && e.seq > toastAfterSeq) toast(e.text);
   }
   while (ol.children.length > 200) ol.firstChild.remove();
   ol.scrollTop = ol.scrollHeight;
@@ -490,6 +555,7 @@ function buildJointRows() {
     };
     range.addEventListener('input', () => setTarget(range.value));
     num.addEventListener('change', () => setTarget(num.value));
+    num.addEventListener('input', () => { edited[i] = true; row.classList.add('edited'); });
     minus.addEventListener('click', () => act('jog_joint', { joint: i, delta: -Number($('jog-step').value) }));
     plus.addEventListener('click', () => act('jog_joint', { joint: i, delta: Number($('jog-step').value) }));
     jointRows.push(r);
@@ -579,7 +645,7 @@ $('set-object').addEventListener('click', () => setPickMode('object'));
 $('set-place').addEventListener('click', () => setPickMode('place'));
 $('plan').addEventListener('click', () => act('plan'));
 $('pick').addEventListener('click', () => act('pick'));
-$('clear-plan').addEventListener('click', () => send('clear_preview'));
+$('clear-plan').addEventListener('click', () => send('clear_plan'));
 $('detect').addEventListener('click', () => act('detect'));
 
 const raycaster = new THREE.Raycaster();

@@ -53,7 +53,7 @@ python3 manipulator_agent.py 0.02 -0.03 0.30 20 --table-z -0.05
 python3 test_pick_runner.py                      # robot side, no hardware (add --broker localhost)
 python3 test_vision_mqtt.py                      # vision MQTT flow, no camera or GPU
 python3 pick_runner.py --dry-run --fake-vision demo   # whole pick cycle, no hardware or broker
-python3 digital_twin.py --sim                    # digital twin on a simulated robot: http://localhost:8080
+python3 digital_twin.py --sim                    # digital twin on a simulated robot (open the address it prints)
 python3 test_digital_twin.py                     # digital twin, no hardware
 ```
 
@@ -70,7 +70,7 @@ MIT-licensed and kept in `twin_web/model/nova2`. The twin follows the robot,
 and the robot follows the twin:
 
 ```
-python3 digital_twin.py --sim                                        # simulated robot, open http://localhost:8080
+python3 digital_twin.py --sim                                        # simulated robot; open the address it prints
 python3 digital_twin.py --robot 192.168.5.1 --table-z -0.05          # the real arm and its gripper
 python3 digital_twin.py --robot 192.168.5.1 --table-z -0.05 --mqtt   # + Detect with the vision PC
 python3 digital_twin.py --sim --fake-vision demo                     # Detect answered with a demo pose
@@ -97,24 +97,55 @@ see it move through the feedback.
 | Pick & place | **Set object** / **Set place**, then click on the table; Ø sets the size. **Plan** shows the path and the grasp as a ghost. **Pick & place** runs `pick_runner.py`'s pick, including the reach check before gripping, and the tomato rides in the fingers. **Detect** (with `--mqtt`) goes home, sends ready and shows the object the vision PC finds. |
 | View | 3D, Top, Front, and **Camera**, which looks through the wrist camera. |
 
+**Access.** The server prints the address to open, including an access
+token: `http://localhost:8080/?token=…`. A page opened without the token,
+or a page from any other site in the same browser, cannot reach the robot.
+`--token` sets a fixed token so you can bookmark the address. By default
+the server listens only on this PC (127.0.0.1). `--host 0.0.0.0` makes it
+reachable from the network, and then anyone with the address, token
+included, can move the robot.
+
 **Safety**
 
 - **Arming:** nothing moves until **Arm** is switched on. Arming needs the
   robot enabled and idle, a table height, and the model check: GetPose
   must agree with the FK of GetAngle within 3 mm.
-- **STOP:** STOP (or Esc) sends Stop() and disarms.
+- **One gate for every step:** every motion and every gripper action the
+  app makes, including each move of a pick, passes one check right before
+  it is sent: armed, not stopped, robot enabled and idle, feedback fresh.
+  STOP holds the same lock, so a move is either sent before the Stop() or
+  not at all.
+- **STOP:** STOP (or Esc), or switching Arm off during a task, sends
+  Stop() and *latches*: nothing else moves, not even the rest of a pick,
+  until you arm again. STOP also works when the command connection is
+  down; it disarms first, then tries to reconnect and send Stop().
 - **Every target is checked:**
   - joint limits
-  - the whole path above the table: the joint path for MovJ, and IK every
-    5 mm on one branch for MovL
+  - the whole path above the table: the joint path for MovJ, sampled at
+    least every 1° (the planners do the same), and IK every 5 mm on one
+    branch for MovL
+  - that the arm hasn't moved since the check
   - the speed cap
   - only one motion at a time
-- **Automatic disarm:** drag mode, an alarm, a collision or a lost
-  connection disarms the app. When the last browser closes or reloads the
-  page, a running move is stopped.
-- **Network access:** by default the server only listens on this PC
-  (127.0.0.1). `--host 0.0.0.0` opens it to the network, and then anyone
-  who opens the page can move the robot.
+- **Automatic disarm:** the app disarms itself when the robot is no longer
+  its to move:
+  - disabled, alarm, collision or pause
+  - drag mode
+  - jogged from the pendant, or moved by another program
+  - its feedback or command connection is lost
+- **Deadman:** a running task is stopped when the last browser closes or
+  reloads the page, or when no browser has been heard from for 3 s. An
+  open page checks in twice a second.
+- **Pick and Detect:**
+  - **Pick** opens the gripper before it comes down, and is refused while
+    the gripper holds something.
+  - **Detect** needs `--mqtt` (or `--fake-vision` in simulation). STOP ends
+    its wait, and a pose is refused if the arm moved while the camera was
+    looking.
+- **What the page shows:** if the page stops receiving the robot's state,
+  it says "the picture is not live", draws the robot see-through and
+  disables every button except STOP. On a phone, STOP floats at the bottom
+  of the screen.
 - **Simulation:** the fingers only close on the object if the tool tip
   really is at it. A pick that misses goes back up and home, as on the
   robot.

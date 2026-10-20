@@ -14,12 +14,19 @@ arm moves -- and from which the arm can be moved and the pick and place run.
                     MovJ / MovL on port 29999; the gripper over RS485.
                     What the twin then shows is again the robot's feedback.
 
+Every motion and gripper step the app makes passes one gate, under the
+same lock STOP takes: armed, not stopped, robot enabled and idle, feedback
+fresh. STOP latches until the next deliberate Arm. The app disarms itself
+when the robot is disabled, alarmed, paused, dragged, moved by someone
+else, or its feedback stops; and stops a running task when no browser is
+left (or none has been heard from for a few seconds).
+
 With --sim the "robot" is fake_dobot.py (same TCP commands, same feedback
 port, Nova 2 speeds), so the app is also the simulator, on the same code
 path as the real arm.
 
 Run:
-    python3 digital_twin.py --sim                               # then open http://localhost:8080
+    python3 digital_twin.py --sim                               # then open the URL it prints
     python3 digital_twin.py --robot 192.168.5.1 --table-z -0.05 # real arm, real gripper (left, ID 21)
     python3 digital_twin.py --robot 192.168.5.1 --table-z -0.05 --mqtt   # + "Detect" with the vision PC
 """
@@ -29,12 +36,15 @@ import asyncio
 import json
 import math
 import queue
+import secrets
 import threading
 import time
 import uuid
 import xml.etree.ElementTree as ET
 from collections import deque
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
+from urllib.parse import urlsplit
 
 import numpy as np
 
@@ -46,7 +56,7 @@ from manipulator_kinematics import (
     joint_map, pose, rot_z,
 )
 from mqtt_link import LocalBus, MessageError
-from pick_runner import DEMO_T_CAMERA_OBJECT, PickFailed, PickRunner, start_fake_vision
+from pick_runner import PickFailed, PickRunner, start_fake_vision
 
 WEB = Path(__file__).resolve().parent / "twin_web"
 URDF = WEB / "model" / "nova2" / "nova2_robot.urdf"
@@ -54,11 +64,19 @@ T_LINK6_FLANGE = pose(rot_z(math.pi / 2), [0.0, 0.0, 0.0])   # Dobot's link6 -> 
 HOME = joint_map.home_servo_deg
 LINE_STEP = 0.005        # [m] straight-line moves are checked every 5 mm
 LINE_MAX_JUMP = 10.0     # [deg] largest joint change per step on a line (more = IK branch switch)
+LINE_ROT_TOL = 0.1       # [deg] a straight-line move keeps the orientation (within reading noise)
 FEEDBACK_STALE = 0.5     # [s] older feedback = robot not connected
+START_TOL = 0.2          # [deg] a checked move only starts from where it was checked
+DISARM_AFTER = 0.15      # [s] a reason to disarm must last this long (one stale packet is not one)
+CLIENT_SILENT = 3.0      # [s] while a task runs, some browser must have been heard from this recently
 
 
 class TwinError(RuntimeError):
     pass
+
+
+class Stopped(TwinError):
+    """STOP, a disarm or a fault ended the task before this step."""
 
 
 # ============================================================
@@ -122,27 +140,118 @@ def model_fk(model, servo_deg):
 
 
 # ============================================================
-# GRIPPER AS THE TWIN SEES IT
+# INPUT CHECKS (a browser can send anything)
 # ============================================================
 
-class TwinGripper:
-    """Wraps the real (or fake) gripper so the twin knows its state and
-    can carry the object. In simulation the fingers only close on the
-    object if the tool tip is really at it."""
+def _num(value, name, lo=-math.inf, hi=math.inf):
+    if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value):
+        raise TwinError(f"{name} must be a finite number")
+    if not lo <= value <= hi:
+        raise TwinError(f"{name} must be {lo:g}..{hi:g}")
+    return float(value)
 
-    def __init__(self, inner, twin, sim):
-        self.inner, self.twin, self.sim = inner, twin, sim
+
+def _vec(value, n, name):
+    if not isinstance(value, (list, tuple)) or len(value) != n:
+        raise TwinError(f"{name} must be {n} numbers")
+    return [_num(v, f"{name}[{i}]") for i, v in enumerate(value)]
+
+
+def _bool(value, name):
+    if not isinstance(value, bool):
+        raise TwinError(f"{name} must be true or false")
+    return value
+
+
+def _pose_from_client(T):
+    if not isinstance(T, (list, tuple)) or len(T) != 4:
+        raise TwinError("a pose is a 4x4 matrix")
+    T = np.array([_vec(row, 4, "pose row") for row in T], dtype=float)
+    R = T[:3, :3]
+    if not np.allclose(R.T @ R, np.eye(3), atol=1e-3) or np.linalg.det(R) < 0:
+        raise TwinError("not a valid pose")
+    U, _, Vt = np.linalg.svd(R)
+    T[:3, :3], T[3] = U @ Vt, [0, 0, 0, 1]
+    return T
+
+
+def _rotation_deg(R_a, R_b):
+    R = R_a.T @ R_b
+    return math.degrees(math.acos(max(-1.0, min(1.0, (np.trace(R) - 1) / 2))))
+
+
+# ============================================================
+# THE ROBOT AND GRIPPER AS THE TWIN'S TASKS SEE THEM
+# ============================================================
+
+class GuardedRobot:
+    """The robot for the twin's tasks and its pick runner: every motion
+    first passes Twin.gate() under Twin.motion_lock -- the lock STOP takes
+    to send Stop() -- so a move is either on its way before the Stop() or
+    never sent. Everything else (GetAngle, GetPose, ...) goes straight through."""
+
+    def __init__(self, robot, twin):
+        self._robot, self._twin = robot, twin
+
+    def __getattr__(self, name):
+        return getattr(self._robot, name)
+
+    def _send(self, send, servo_deg, v, a):
+        with self._twin.motion_lock:
+            self._twin.gate()
+            cmd_id = send(servo_deg, v, a)
+            self._twin.moved = True
+        return cmd_id
+
+    def mov_j(self, servo_deg, v=20, a=20):
+        return self._send(self._robot.mov_j, servo_deg, v, a)
+
+    def mov_l(self, servo_deg, v=10, a=10):
+        return self._send(self._robot.mov_l, servo_deg, v, a)
+
+    def move_j(self, servo_deg, v=20, a=20, tol_deg=0.3, timeout=60.0, what="MovJ"):
+        target = np.asarray(servo_deg, dtype=float)
+        cmd_id = self.mov_j(target, v, a)
+        return self._robot.wait_motion(cmd_id, lambda q: np.abs(q - target).max() <= tol_deg, timeout, what)
+
+    def move_l(self, servo_deg, reached, v=10, a=10, timeout=60.0, what="MovL"):
+        cmd_id = self.mov_l(servo_deg, v, a)
+        return self._robot.wait_motion(cmd_id, reached, timeout, what)
+
+
+class TwinGripper:
+    """Wraps the real (or fake) gripper: each action passes the twin's gate,
+    and the twin learns the result (and carries the object). A fake gripper
+    (--sim, --no-gripper) only closes on the object if the tool tip is
+    really at it."""
+
+    def __init__(self, inner, twin):
+        self.inner, self.twin = inner, twin
+
+    def _gate(self):
+        with self.twin.motion_lock:
+            self.twin.gate()
 
     def open(self, speed=100, wait=True):
+        self._gate()
         self.inner.open(speed, wait)
         self.twin._gripper_changed(0, False)
 
     def close(self, speed=50):
-        if self.sim and isinstance(self.inner, FakeGripper):
-            self.inner.object_position = 140 if self.twin._object_between_fingers() else None
+        self._gate()
+        if isinstance(self.inner, FakeGripper):
+            held = self.twin.grip["holding"]
+            self.inner.object_position = (self.twin.grip["position"] if held else
+                                          140 if self.twin._object_between_fingers() else None)
         result = self.inner.close(speed)
         self.twin._gripper_changed(result.position, result.holding)
         return result
+
+    def position(self):
+        """Where the fingers are now (0 open .. 255 closed), if the gripper can say."""
+        if hasattr(self.inner, "read_raw"):
+            return self.inner.from_raw(self.inner.read_raw())
+        return getattr(self.inner, "position", 0)
 
     def disconnect(self):
         self.inner.disconnect()
@@ -160,10 +269,12 @@ class Twin:
         self.home = np.asarray(HOME if home is None else home, dtype=float)
         self.max_speed = int(max_speed)
         self.speed = min(20, self.max_speed)
-        self.lock = threading.RLock()
+        self.lock = threading.RLock()        # the twin's state
+        self.motion_lock = threading.Lock()  # gate + send vs Stop()
         self.armed = False
         self.task = self.step = None
-        self.cancel = threading.Event()
+        self.cancel = threading.Event()      # STOP latch, cleared only by Arm
+        self.moved = False                   # the running task has sent a motion
         self.model_error_mm = None
         self.object = None          # {"T": 4x4, "diameter", "attached", "T_tool_obj", "source"}
         self.object_diameter = object_diameter
@@ -174,14 +285,23 @@ class Twin:
         self._log = deque(maxlen=300)
         self._log_seq = 0
         self._print = log
+        self.can_detect = link is not None
         self.link = link or LocalBus()
-        self.gripper = TwinGripper(gripper, self, sim)
-        self.runner = PickRunner(robot, self.gripper, self.link, home=self.home, table_z=table_z,
+        self.guarded = GuardedRobot(robot, self)
+        self.gripper = TwinGripper(gripper, self)
+        try:
+            self.grip["position"] = int(self.gripper.position())
+        except (GripperError, OSError) as e:
+            self.log(f"gripper position unknown: {e}", "warn")
+        self.runner = PickRunner(self.guarded, self.gripper, self.link, home=self.home, table_z=table_z,
                                  log=lambda text: self.log(text, "info"))
+        self.runner.cancel = self.cancel
         self.runner.on_status = lambda state, detail: self._set_step(f"{state}" + (f": {detail}" if detail else ""))
         self.fake = None            # the simulated controller, with --sim
+        self.clients_heard = None   # set by the web server: seconds since any browser spoke
         self._tasks = queue.Queue()
         threading.Thread(target=self._worker, daemon=True, name="twin-tasks").start()
+        threading.Thread(target=self._watch, daemon=True, name="twin-watch").start()
 
     # ------------------------------------------------------------ log / state
     def log(self, text, level="info"):
@@ -227,12 +347,94 @@ class Twin:
                        "attached": self.object["attached"], "source": self.object["source"]}
             return {
                 "type": "state", "t": time.time(), "robot": robot, "armed": self.armed,
-                "task": self.task, "step": self.step, "speed": self.speed, "max_speed": self.max_speed,
+                "stopped": self.cancel.is_set(), "task": self.task, "step": self.step,
+                "speed": self.speed, "max_speed": self.max_speed,
                 "gripper": dict(self.grip), "object": obj, "place": self.place, "table_z": self.table_z,
                 "ghost": None if self.ghost is None else np.round(self.ghost, 4).tolist(),
                 "plan": self.plan, "model_error_mm": self.model_error_mm, "sim": self.sim,
-                "log_seq": self._log_seq,
+                "can_detect": self.can_detect, "log_seq": self._log_seq,
             }
+
+    # ------------------------------------------------------------ the gate
+    def gate(self):
+        """Raise Stopped unless the app may move the arm now. Called under
+        motion_lock right before every motion or gripper step."""
+        if self.cancel.is_set() or not self.armed:
+            raise Stopped("stopped")
+        if self.feedback.age() > FEEDBACK_STALE:
+            raise Stopped("no feedback from the robot")
+        mode = self.robot.robot_mode()
+        if mode != MODE_IDLE:
+            raise Stopped(f"the robot is {MODE_NAMES.get(mode, mode)}")
+
+    def request_stop(self):
+        """The STOP latch, at once and without robot I/O."""
+        self.cancel.set()
+        with self.lock:
+            self.armed = False
+
+    def _send_stop(self):
+        """Stop() after any move already through the gate; reconnect once
+        if the command link is down. Returns whether it reached the robot."""
+        with self.motion_lock:
+            for attempt in (1, 2):
+                try:
+                    if not self.robot.connected:
+                        self.robot.connect()
+                    self.robot.stop()
+                    return True
+                except (DobotError, OSError) as e:
+                    if attempt == 2:
+                        self.log(f"Stop() did not reach the robot ({e}): use the emergency stop", "error")
+        return False
+
+    def _abort(self, why):
+        """A fault: latch, disarm, and stop the robot if a task was moving it."""
+        busy = self.task is not None
+        self.request_stop()
+        if busy:
+            self._send_stop()
+        self.log(f"{why} -- disarmed", "error")
+
+    def _watch(self):
+        """Disarm when the robot is no longer the app's to move: disabled,
+        alarm, collision, paused, drag mode, moving without the app, or
+        silent; stop a task no browser is watching any more."""
+        since = {}
+        while True:
+            time.sleep(0.05)
+            if not self.armed:
+                since.clear()
+                continue
+            why = None
+            s, age = self.feedback.latest(), self.feedback.age()
+            heard = self.clients_heard() if self.clients_heard else 0.0
+            if s is None or age > FEEDBACK_STALE:
+                why = "no feedback from the robot"
+            elif s["drag_status"] or s["robot_mode"] == 6:
+                why = "the robot is in drag mode"
+            elif s["error_status"] or s["collision_state"] or s["robot_mode"] in (9, 11):
+                why = f"the robot is {MODE_NAMES.get(int(s['robot_mode']), 'in alarm')}"
+            elif s["robot_mode"] in (1, 2, 3, 4):
+                why = f"the robot is {MODE_NAMES.get(int(s['robot_mode']))}"
+            elif s["robot_mode"] == 10:
+                why = "the robot was paused"
+            elif s["robot_mode"] == 8:
+                why = "someone is jogging the robot"
+            elif s["robot_mode"] == 7 and self.task is None:
+                why = "the robot is moving, but not for this app"
+            elif self.task is not None and heard > CLIENT_SILENT:
+                why = f"no browser heard from for {heard:.0f} s"
+            now = time.monotonic()
+            for key in list(since):
+                if key != why:
+                    del since[key]
+            if why is None:
+                continue
+            since.setdefault(why, now)
+            if now - since[why] >= DISARM_AFTER:
+                self._abort(why)
+                since.clear()
 
     # ------------------------------------------------------------ checks
     def _joints_now(self):
@@ -264,10 +466,13 @@ class Twin:
 
     def check_line(self, q_from, T_to):
         """A straight tool line (MovL) from q_from to T_to: IK every 5 mm on
-        one branch, above the table. Returns the joints at the end."""
+        one branch, above the table. The line keeps the tool's orientation.
+        Returns (joints at the end, the end pose actually used)."""
         T_from = fk(joint_map.servo_to_visual(q_from), "tool")
-        if not np.allclose(T_from[:3, :3], T_to[:3, :3], atol=1e-6):
+        if _rotation_deg(T_from[:3, :3], T_to[:3, :3]) > LINE_ROT_TOL:
             raise TwinError("a straight-line move here keeps the tool's orientation; use a joint move to turn it")
+        T_to = T_to.copy()
+        T_to[:3, :3] = T_from[:3, :3]
         n = max(1, math.ceil(np.linalg.norm(T_to[:3, 3] - T_from[:3, 3]) / LINE_STEP))
         q, table = np.asarray(q_from, dtype=float), self._table()
         for k in range(1, n + 1):
@@ -285,7 +490,7 @@ class Twin:
                 if bad:
                     raise TwinError("the line goes below the table: " + ", ".join(bad))
             q = q_next
-        return q
+        return q, T_to
 
     def ik(self, T_tool, ref):
         try:
@@ -298,21 +503,23 @@ class Twin:
             if self.object is None or self.object["attached"]:
                 return False
             center, d = self.object["T"][:3, 3], self.object["diameter"]
-        tip = fk(joint_map.servo_to_visual(self._joints_now()), "tool")[:3, 3]
+        tip = fk(joint_map.servo_to_visual(self.robot.get_angle()), "tool")[:3, 3]
         return float(np.linalg.norm(tip - center)) <= max(0.012, 0.35 * d)
 
     def _gripper_changed(self, position, holding):
-        q = self._joints_now()
-        T_tool = fk(joint_map.servo_to_visual(q), "tool")
-        with self.lock:
+        with self.lock:   # the state first: nothing below may leave it stale
             self.grip = {"position": int(position), "holding": bool(holding)}
+        T_tool = fk(joint_map.servo_to_visual(self.robot.get_angle()), "tool")
+        with self.lock:
             if holding:
-                if self.object is None or self.object["attached"] or \
-                        np.linalg.norm(self.object["T"][:3, 3] - T_tool[:3, 3]) > max(0.03, self.object["diameter"]):
+                if self.object is None or \
+                        (not self.object["attached"] and
+                         np.linalg.norm(self.object["T"][:3, 3] - T_tool[:3, 3]) > max(0.03, self.object["diameter"])):
                     # something the twin did not know about: show it in the fingers
                     self.object = {"T": T_tool.copy(), "diameter": self.object_diameter, "source": "gripped"}
-                self.object["attached"] = True
-                self.object["T_tool_obj"] = np.linalg.inv(T_tool) @ self.object["T"]
+                if not self.object.get("attached"):
+                    self.object["attached"] = True
+                    self.object["T_tool_obj"] = np.linalg.inv(T_tool) @ self.object["T"]
             elif self.object is not None and self.object.get("attached"):
                 self.object["attached"] = False
                 T = T_tool @ self.object["T_tool_obj"]   # where the fingers let it go
@@ -321,38 +528,52 @@ class Twin:
                 self.object["T"] = T
 
     # ------------------------------------------------------------ tasks
-    def _queue(self, name, fn):
+    def _queue(self, name, fn, q_from=None):
+        """Run fn on the task thread. q_from: the joints the move was checked
+        from; it only starts if the arm is still there."""
         with self.lock:
             if self.task is not None:
                 raise TwinError(f"busy: {self.task}")
-            if not self.armed:
+            if not self.armed or self.cancel.is_set():
                 raise TwinError("not armed: switch on 'Arm' to let the app move the robot")
             self.task, self.step = name, None
-            self.cancel.clear()
-        self._tasks.put((name, fn))
+        self._tasks.put((name, fn, q_from))
         return {"queued": name}
 
     def _worker(self):
         while True:
-            name, fn = self._tasks.get()
+            name, fn, q_from = self._tasks.get()
+            self.moved = False
             self.log(f"{name}: started")
             try:
+                if self.cancel.is_set() or not self.armed:
+                    raise Stopped("stopped before it started")
+                if q_from is not None and np.abs(self.robot.get_angle() - q_from).max() > START_TOL:
+                    raise TwinError("the arm moved since this move was checked: try again")
                 fn()
                 self.log(f"{name}: done")
-            except (PickFailed, IKError, TwinError) as e:
+            except PickFailed as e:              # missed grip: back home, or nothing moved
                 self.log(f"{name}: {e}", "warn")
+            except (IKError, TwinError) as e:
+                if self.moved or isinstance(e, Stopped):
+                    if not self.cancel.is_set():
+                        self._abort(f"{name}: {e}")
+                    else:
+                        self.log(f"{name}: {e}", "warn")
+                else:
+                    self.log(f"{name}: {e}", "warn")   # refused before any motion
             except (DobotError, GripperError, OSError) as e:
-                with self.lock:
-                    self.armed = False
-                self.log(f"{name}: {e} -- disarmed", "error")
+                if self.cancel.is_set() and "stopped" in str(e):
+                    self.log(f"{name}: stopped", "warn")
+                else:
+                    self._abort(f"{name}: {e}")
             except Exception as e:   # a bug must not kill the worker
-                with self.lock:
-                    self.armed = False
-                self.log(f"{name}: unexpected {type(e).__name__}: {e} -- disarmed", "error")
+                self._abort(f"{name}: unexpected {type(e).__name__}: {e}")
             finally:
                 with self.lock:
                     self.task = None
                     self.ghost = None
+                    self.plan = None
 
     def _speeds(self):
         self.runner.speed = self.speed
@@ -360,20 +581,19 @@ class Twin:
 
     def _move_joints(self, q, what):
         self._speeds()
-        self.robot.move_j(q, v=self.runner.speed, a=self.runner.speed, what=what)
+        self.guarded.move_j(q, v=self.runner.speed, a=self.runner.speed, what=what)
 
     def _move_line(self, q, T, what):
         self._speeds()
-        reached = self.runner._reached(T)
-        self.robot.move_l(q, reached, v=self.runner.line_speed, a=self.runner.line_speed, what=what)
+        self.guarded.move_l(q, self.runner._reached(T), v=self.runner.line_speed, a=self.runner.line_speed, what=what)
 
     # ------------------------------------------------------------ pick & place
     def _object_message(self, q_now):
         with self.lock:
             if self.object is None:
                 raise TwinError("no object: click 'Set object' and then the table, or press Detect")
-            if self.object["attached"]:
-                raise TwinError("the gripper is already holding the object")
+            if self.object["attached"] or self.grip["holding"]:
+                raise TwinError("the gripper is holding something: open it (or place it) first")
             T_base_object = self.object["T"].copy()
             d = self.object["diameter"]
         T_camera_object = np.linalg.inv(fk(joint_map.servo_to_visual(q_now), "camera")) @ T_base_object
@@ -405,26 +625,36 @@ class Twin:
         """One command from a browser -> reply dict. Motions are queued; the
         reply says whether they were accepted, the state shows the rest."""
         try:
+            if not isinstance(cmd, dict):
+                raise TwinError("a command is a JSON object")
             name = cmd.get("cmd")
-            if not self.robot.connected:
-                # the command port dropped: reconnect (a lost motion is never re-sent)
-                self.robot.connect()
-                self.log("command connection to the robot re-opened", "warn")
-            fn = getattr(self, f"cmd_{name}", None)
+            args = {k: v for k, v in cmd.items() if k not in ("cmd", "id")}
+            fn = getattr(self, f"cmd_{name}", None) if isinstance(name, str) else None
             if fn is None:
                 raise TwinError(f"unknown command {name!r}")
-            return {"ok": True, **(fn(**{k: v for k, v in cmd.items() if k not in ("cmd", "id")}) or {})}
-        except (TwinError, IKError, MessageError, DobotError, GripperError, ValueError, TypeError, OSError) as e:
+            if name not in ("stop", "arm") and not self.robot.connected:
+                # the command port dropped: disarm, then reconnect (a lost motion is never re-sent)
+                if self.armed:
+                    self._abort("command connection to the robot lost")
+                self.robot.connect()
+                self.log("command connection to the robot re-opened", "warn")
+            return {"ok": True, **(fn(**args) or {})}
+        except (TwinError, IKError, MessageError, DobotError, GripperError, OSError) as e:
             return {"ok": False, "error": str(e)}
+        except Exception as e:   # bad arguments must not cost the browser its connection
+            return {"ok": False, "error": f"bad command: {type(e).__name__}: {e}"}
 
     def cmd_arm(self, on=True):
-        if not on:
-            with self.lock:
-                self.armed = False
+        if not _bool(on, "on"):
+            if self.task is not None:
+                return self.cmd_stop()   # taking the permission away stops what it allowed
+            self.request_stop()
             self.log("disarmed")
             return {}
         if not self.robot_state()["connected"]:
             raise TwinError("no feedback from the robot")
+        if not self.robot.connected:
+            self.robot.connect()
         mode = self.robot.robot_mode()   # the controller's own word, not feedback up to 8 ms old
         if mode != MODE_IDLE:
             raise TwinError(f"the robot is {MODE_NAMES.get(mode, mode)}: enable it first")
@@ -435,18 +665,20 @@ class Twin:
         if self.model_error_mm > 3.0:
             raise TwinError(f"the kinematic model is {self.model_error_mm:.1f} mm off the controller: not arming")
         with self.lock:
+            if self.task is not None:
+                raise TwinError(f"busy: {self.task}")
+            self.cancel.clear()
             self.armed = True
         self.log("armed: the app may move the robot", "warn")
         return {}
 
     def cmd_stop(self):
-        self.cancel.set()
-        with self.lock:
-            self.armed = False
-        try:
-            self.robot.stop()
-        finally:
-            self.log("STOP sent, disarmed", "error")
+        self.request_stop()
+        sent = self._send_stop()
+        self.log("STOP: disarmed" + (", Stop() sent" if sent else ""), "error")
+        return {"sent": sent}
+
+    def cmd_keepalive(self):
         return {}
 
     def cmd_enable(self):
@@ -466,7 +698,7 @@ class Twin:
         with self.lock:
             if self.task:
                 raise TwinError(f"busy: {self.task}")
-            self.armed = False
+        self.request_stop()
         self.robot.disable()
         self.log("robot disabled")
         return {}
@@ -477,10 +709,11 @@ class Twin:
         return {}
 
     def cmd_drag(self, on=True):
+        on = _bool(on, "on")
         with self.lock:
             if self.task:
                 raise TwinError(f"busy: {self.task}")
-            self.armed = False   # nothing from the app moves the arm while a hand does
+        self.request_stop()   # nothing from the app moves the arm while a hand does
         if on:
             self.robot.start_drag()
             self.log("drag mode: move the arm by hand, the twin follows", "warn")
@@ -490,11 +723,9 @@ class Twin:
         return {}
 
     def cmd_speed(self, value):
-        value = int(value)
-        if not 1 <= value <= self.max_speed:
-            raise TwinError(f"speed must be 1..{self.max_speed} %")
+        value = _num(value, "speed", 1, self.max_speed)
         with self.lock:
-            self.speed = value
+            self.speed = int(value)
         return {}
 
     def check_model(self):
@@ -508,7 +739,7 @@ class Twin:
 
     # previews (no motion, allowed any time)
     def cmd_preview_joints(self, joints):
-        q_to = self.check_joint_move(self._joints_now(), joints)
+        q_to = self.check_joint_move(self._joints_now(), _vec(joints, 6, "joints"))
         with self.lock:
             self.ghost = q_to
         return {"joints": q_to.tolist()}
@@ -516,7 +747,7 @@ class Twin:
     def cmd_preview_pose(self, T, linear=False):
         T = _pose_from_client(T)
         q_now = self._joints_now()
-        q = self.check_line(q_now, T) if linear else self.check_joint_move(q_now, self.ik(T, q_now))
+        q = self.check_line(q_now, T)[0] if _bool(linear, "linear") else self.check_joint_move(q_now, self.ik(T, q_now))
         with self.lock:
             self.ghost = q
         return {"joints": np.round(q, 4).tolist()}
@@ -524,43 +755,50 @@ class Twin:
     def cmd_clear_preview(self):
         with self.lock:
             self.ghost = None
+        return {}
+
+    def cmd_clear_plan(self):
+        with self.lock:
+            self.ghost = None
             self.plan = None
         return {}
 
     # motions (armed, one at a time)
     def cmd_move_joints(self, joints):
-        q_to = self.check_joint_move(self._joints_now(), joints)
+        q_from = self._joints_now()
+        q_to = self.check_joint_move(q_from, _vec(joints, 6, "joints"))
         with self.lock:
             self.ghost = q_to
-        return self._queue("move joints", lambda: self._move_joints(q_to, "move joints"))
+        return self._queue("move joints", lambda: self._move_joints(q_to, "move joints"), q_from)
 
     def cmd_jog_joint(self, joint, delta):
+        i = joint if isinstance(joint, int) and not isinstance(joint, bool) else -1
+        if not 0 <= i < 6:
+            raise TwinError("jog: joint must be 0..5")
         q = self._joints_now()
-        i = int(joint)
-        if not 0 <= i < 6 or abs(float(delta)) > 30:
-            raise TwinError("jog: joint 0..5, at most 30 deg")
-        q[i] += float(delta)
+        q[i] += _num(delta, "jog", -30, 30)
         return self.cmd_move_joints(q.tolist())
 
     def cmd_move_pose(self, T, linear=False):
         T = _pose_from_client(T)
-        q_now = self._joints_now()
-        if linear:
-            q = self.check_line(q_now, T)
+        q_from = self._joints_now()
+        if _bool(linear, "linear"):
+            q, T = self.check_line(q_from, T)
             with self.lock:
                 self.ghost = q
-            return self._queue("move line", lambda: self._move_line(q, T, "move line"))
-        q = self.check_joint_move(q_now, self.ik(T, q_now))
+            return self._queue("move line", lambda: self._move_line(q, T, "move line"), q_from)
+        q = self.check_joint_move(q_from, self.ik(T, q_from))
         with self.lock:
             self.ghost = q
-        return self._queue("move to pose", lambda: self._move_joints(q, "move to pose"))
+        return self._queue("move to pose", lambda: self._move_joints(q, "move to pose"), q_from)
 
     def cmd_jog_tool(self, axis, delta):
         """Straight-line jog of the tool tip along a base axis, delta in mm."""
-        if axis not in ("x", "y", "z") or abs(float(delta)) > 100:
-            raise TwinError("jog: axis x / y / z, at most 100 mm")
+        if axis not in ("x", "y", "z"):
+            raise TwinError("jog: axis x / y / z")
+        delta = _num(delta, "jog", -100, 100)
         T = fk(joint_map.servo_to_visual(self._joints_now()), "tool")
-        T[{"x": 0, "y": 1, "z": 2}[axis], 3] += float(delta) / 1000
+        T[{"x": 0, "y": 1, "z": 2}[axis], 3] += delta / 1000
         return self.cmd_move_pose(T.tolist(), linear=True)
 
     def cmd_home(self):
@@ -573,18 +811,22 @@ class Twin:
 
     # the scene
     def cmd_set_object(self, xyz=None, xy=None, yaw_deg=0.0, diameter=None):
-        d = float(diameter or self.object_diameter)
-        if not 0.01 <= d <= 0.2:
-            raise TwinError("object diameter must be 1..20 cm")
+        d = self.object_diameter if diameter is None else _num(diameter, "diameter", 0.01, 0.2)
         if xy is not None:
             if self.table_z is None:
                 raise TwinError("no table height")
-            xyz = [float(xy[0]), float(xy[1]), self.table_z + d / 2]
-        xyz = [float(v) for v in xyz]
+            x, y = _vec(xy, 2, "xy")
+            xyz = [x, y, self.table_z + d / 2]
+        elif xyz is None:
+            raise TwinError("give xy (on the table) or xyz")
+        xyz = _vec(xyz, 3, "xyz")
+        if max(abs(v) for v in xyz) > 2.0:
+            raise TwinError("the object is more than 2 m from the robot")
+        yaw = _num(yaw_deg, "yaw_deg", -360, 360)
         with self.lock:
-            if self.object is not None and self.object["attached"]:
+            if (self.object is not None and self.object["attached"]) or self.grip["holding"]:
                 raise TwinError("the gripper is holding the object")
-            self.object = {"T": pose(rot_z(math.radians(float(yaw_deg))), xyz), "diameter": d,
+            self.object = {"T": pose(rot_z(math.radians(yaw)), xyz), "diameter": d,
                            "attached": False, "source": "manual"}
             self.plan = None
         return {}
@@ -597,8 +839,11 @@ class Twin:
         return {}
 
     def cmd_set_place(self, xy=None):
+        place = None if xy is None else _vec(xy, 2, "xy")
+        if place is not None and max(abs(v) for v in place) > 2.0:
+            raise TwinError("the place spot is more than 2 m from the robot")
         with self.lock:
-            self.place = None if xy is None else [float(xy[0]), float(xy[1])]
+            self.place = place
             self.plan = None
         return {}
 
@@ -609,7 +854,8 @@ class Twin:
         self.plan_pick()   # refuse now if it can't be done
 
         def run():
-            q_now = self._joints_now()
+            self.gripper.open()   # as pick_runner does: never come down on it with closed fingers
+            q_now = self.robot.get_angle()
             msg = self._object_message(q_now)
             _, moves, _, _ = self.runner.plan(msg, q_now, self.place)
             with self.lock:
@@ -620,17 +866,25 @@ class Twin:
 
     def cmd_detect(self, timeout=60.0):
         """Home, ready over MQTT, wait for the vision PC's pose, show the object."""
+        if not self.can_detect:
+            raise TwinError("no vision link: start with --mqtt (or --fake-vision in --sim)")
+        timeout = _num(timeout, "timeout", 1, 300)
+        if self.grip["holding"]:
+            raise TwinError("the gripper is holding something: open it (or place it) first")
+
         def run():
-            q = self._joints_now()
+            q = self.robot.get_angle()
             if np.abs(q - self.home).max() > 0.3:
                 self.check_joint_move(q, self.home)
                 self._move_joints(self.home, "home for the camera")
             self.runner.request_id = uuid.uuid4().hex[:8]
-            self.runner.pose_timeout = float(timeout)
+            self.runner.pose_timeout = timeout
             while not self.runner.pose_queue.empty():
                 self.runner.pose_queue.get_nowait()
-            q_detect = self._joints_now()
+            q_detect = self.robot.get_angle()
             msg = self.runner.wait_pose(q_detect)
+            if np.abs(self.robot.get_angle() - q_detect).max() > 0.05:
+                raise TwinError("the arm moved while the camera was looking: press Detect again")
             T_base_object = fk(joint_map.servo_to_visual(q_detect), "camera") @ msg["T_camera_object"]
             with self.lock:
                 self.object = {"T": T_base_object, "diameter": float(msg.get("diameter") or self.object_diameter),
@@ -640,24 +894,30 @@ class Twin:
         return self._queue("detect", run)
 
 
-def _pose_from_client(T):
-    T = np.asarray(T, dtype=float).reshape(4, 4)
-    R = T[:3, :3]
-    if not np.all(np.isfinite(T)) or not np.allclose(R.T @ R, np.eye(3), atol=1e-3) or np.linalg.det(R) < 0:
-        raise TwinError("not a valid pose")
-    U, _, Vt = np.linalg.svd(R)
-    T[:3, :3], T[3] = U @ Vt, [0, 0, 0, 1]
-    return T
-
-
 # ============================================================
 # WEB SERVER
 # ============================================================
 
-def make_app(twin, model, config):
+def _no_constants(name):
+    raise ValueError(f"{name} is not a number")
+
+
+def make_app(twin, model, config, token):
+    """The twin's web app. Browsers must open it with ?token=... (printed at
+    start) and from its own address: a page from anywhere else can't reach
+    the WebSocket that moves the robot."""
     from aiohttp import WSMsgType, web
 
-    clients = {}   # ws -> last log seq sent
+    clients = {}                                        # ws -> {"seq": last log sent, "heard": monotonic}
+    instance = secrets.token_hex(4)                     # a restarted server starts its log afresh
+    work = ThreadPoolExecutor(4, thread_name_prefix="twin-cmd")     # ordinary commands
+    stops = ThreadPoolExecutor(1, thread_name_prefix="twin-stop")   # STOP never waits behind them
+
+    def heard():
+        if not clients:
+            return math.inf
+        return time.monotonic() - max(c["heard"] for c in clients.values())
+    twin.clients_heard = heard
 
     async def index(request):
         return web.FileResponse(WEB / "index.html")
@@ -665,33 +925,72 @@ def make_app(twin, model, config):
     async def api_model(request):
         return web.json_response(model)
 
+    def allowed(request):
+        origin = request.headers.get("Origin")
+        if origin is not None and urlsplit(origin).netloc != request.host:
+            return False
+        return secrets.compare_digest(request.query.get("token", ""), token)
+
+    async def stop_now(loop):
+        twin.request_stop()                        # latched at once, on the event loop
+        return await loop.run_in_executor(stops, twin.cmd_stop)
+
     async def ws_handler(request):
-        ws = web.WebSocketResponse(heartbeat=10)
+        ws = web.WebSocketResponse(heartbeat=2.0, max_msg_size=64 * 1024)
         await ws.prepare(request)
-        clients[ws] = 0
-        await ws.send_json({"type": "hello", "model": model, "config": config})
+        if not allowed(request):
+            await ws.send_json({"type": "denied", "error": "open the address digital_twin.py printed (with its token)"})
+            await ws.close(code=4003, message=b"denied")
+            return ws
         loop = asyncio.get_running_loop()
+        clients[ws] = {"seq": 0, "heard": time.monotonic()}
+        inbox = asyncio.Queue()
+        await ws.send_json({"type": "hello", "model": model, "config": config, "log_seq": twin._log_seq,
+                            "instance": instance})
+
+        async def reply(cmd, result):
+            if not ws.closed:
+                await ws.send_json({"type": "reply", "id": cmd.get("id"), "cmd": cmd.get("cmd"), **result},
+                                   dumps=lambda o: json.dumps(o, allow_nan=False, default=str))
+
+        async def run_commands():   # this browser's commands, one at a time
+            while True:
+                cmd = await inbox.get()
+                result = await loop.run_in_executor(work, twin.handle, cmd)
+                await reply(cmd, result)
+
+        runner = asyncio.create_task(run_commands())
         try:
             async for msg in ws:
                 if msg.type != WSMsgType.TEXT:
                     continue
+                clients[ws]["heard"] = time.monotonic()
                 try:
-                    cmd = json.loads(msg.data)
+                    cmd = json.loads(msg.data, parse_constant=_no_constants)
                     if not isinstance(cmd, dict):
                         raise ValueError("a command is a JSON object")
-                except ValueError as e:
-                    await ws.send_json({"type": "reply", "id": None, "ok": False, "error": str(e)})
+                except (ValueError, RecursionError) as e:
+                    await reply({}, {"ok": False, "error": f"bad message: {e}"})
                     continue
-                reply = await loop.run_in_executor(None, twin.handle, cmd)
-                await ws.send_json({"type": "reply", "id": cmd.get("id"), "cmd": cmd.get("cmd"), **reply})
+                if cmd.get("cmd") == "keepalive":
+                    continue
+                if cmd.get("cmd") == "stop":
+                    await reply(cmd, {"ok": True, **await stop_now(loop)})
+                elif cmd.get("cmd") == "arm" and cmd.get("on") is False and twin.task is not None:
+                    await reply(cmd, {"ok": True, **await stop_now(loop)})
+                else:
+                    inbox.put_nowait(cmd)
         finally:
+            runner.cancel()
             clients.pop(ws, None)
             if not clients:
                 # nobody is watching any more: nothing may keep moving
-                if twin.task:
-                    await loop.run_in_executor(None, twin.cmd_stop)
+                if twin.task is not None:
+                    await stop_now(loop)
+                    twin.log("the last browser closed: stopped", "error")
                 elif twin.armed:
-                    twin.cmd_arm(False)
+                    twin.request_stop()
+                    twin.log("the last browser closed: disarmed", "warn")
         return ws
 
     async def broadcast(app):
@@ -699,16 +998,21 @@ def make_app(twin, model, config):
             await asyncio.sleep(1 / 30)
             if not clients:
                 continue
-            text = json.dumps(twin.snapshot())
-            for ws, seq in list(clients.items()):
+            try:
+                text = json.dumps(twin.snapshot(), allow_nan=False)
+            except ValueError as e:   # never send what a browser can't parse
+                twin.log(f"state not sent: {e}", "error")
+                await asyncio.sleep(1)
+                continue
+            for ws, c in list(clients.items()):
                 if ws.closed:
                     continue
                 try:
                     await ws.send_str(text)
-                    entries = twin.logs_after(seq)
+                    entries = twin.logs_after(c["seq"])
                     if entries:
                         await ws.send_json({"type": "log", "entries": entries})
-                        clients[ws] = entries[-1]["seq"]
+                        c["seq"] = entries[-1]["seq"]
                 except (ConnectionError, RuntimeError):
                     pass
 
@@ -717,6 +1021,8 @@ def make_app(twin, model, config):
 
     async def stop_broadcast(app):
         app["broadcast"].cancel()
+        work.shutdown(wait=False)
+        stops.shutdown(wait=False)
 
     app = web.Application()
     app.router.add_get("/", index)
@@ -726,6 +1032,12 @@ def make_app(twin, model, config):
     app.on_startup.append(start_broadcast)
     app.on_cleanup.append(stop_broadcast)
     return app
+
+
+def demo_pose_on_table(table_z, xy=(-0.42, 0.12), diameter=0.06):
+    """--fake-vision demo: a tomato seen from home, resting on the twin's table."""
+    T_base_object = pose(np.eye(3), [xy[0], xy[1], table_z + diameter / 2])
+    return np.linalg.inv(fk(np.zeros(6), "camera")) @ T_base_object
 
 
 def build(args):
@@ -753,7 +1065,8 @@ def build(args):
     if args.fake_vision:
         from pick_from_pose import load_pose
         link = LocalBus()
-        start_fake_vision(link, DEMO_T_CAMERA_OBJECT if args.fake_vision == "demo" else load_pose(args.fake_vision))
+        start_fake_vision(link, demo_pose_on_table(args.table_z) if args.fake_vision == "demo"
+                          else load_pose(args.fake_vision))
     elif args.mqtt:
         from mqtt_link import MqttLink
         link = MqttLink(client_id=f"digital_twin_{uuid.uuid4().hex[:6]}").connect()
@@ -769,7 +1082,7 @@ def build(args):
     except DobotError as e:
         twin.log(f"model check failed: {e}", "error")
     config = {"sim": bool(args.sim), "robot": None if args.sim else args.robot, "table_z": args.table_z,
-              "detect": bool(args.mqtt or args.fake_vision), "max_speed": args.max_speed,
+              "detect": twin.can_detect, "max_speed": args.max_speed,
               "gripper": "simulated" if isinstance(gripper, FakeGripper) else "Feetech"}
 
     def cleanup():
@@ -794,8 +1107,9 @@ def main():
     p.add_argument("--place", type=float, nargs=2, metavar=("X", "Y"), help="default place spot [m]")
     p.add_argument("--max-speed", type=int, default=50, help="highest speed %% the app may use (default 50)")
     p.add_argument("--host", default="127.0.0.1", help="listen address (0.0.0.0 = whole network: anyone "
-                   "who can open the page can move the robot)")
+                   "with the printed address, token included, can move the robot)")
     p.add_argument("--port", type=int, default=8080)
+    p.add_argument("--token", help="access token in the address (default: a new random one each start)")
     p.add_argument("--arm", choices=("left", "right"), help="which gripper (default as x-trainer pairs the IPs)")
     p.add_argument("--gripper-port")
     p.add_argument("--gripper-id", type=int)
@@ -816,17 +1130,22 @@ def main():
     if args.robot and args.arm is None and args.robot not in (LEFT["robot_ip"], RIGHT["robot_ip"]) \
             and not args.no_gripper:
         p.error(f"which gripper goes with {args.robot}? pass --arm left or --arm right")
+    if args.token is not None and len(args.token) < 8:
+        p.error("--token: at least 8 characters")
 
     from aiohttp import web
+    token = args.token or secrets.token_urlsafe(12)
     twin, config, cleanup = build(args)
-    app = make_app(twin, load_model(), config)
-    print(f"digital twin: http://{'localhost' if args.host in ('127.0.0.1', '0.0.0.0') else args.host}:{args.port}"
-          f"  ({'simulated robot' if args.sim else 'robot ' + args.robot})")
+    app = make_app(twin, load_model(), config, token)
+    host = "localhost" if args.host in ("127.0.0.1", "0.0.0.0") else args.host
+    print(f"digital twin ({'simulated robot' if args.sim else 'robot ' + args.robot}): "
+          f"open http://{host}:{args.port}/?token={token}")
     try:
         web.run_app(app, host=args.host, port=args.port, print=None)
     finally:
         try:
             if twin.task:
+                twin.request_stop()
                 twin.robot.stop()
         except (DobotError, OSError):
             pass

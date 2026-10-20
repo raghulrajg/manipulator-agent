@@ -23,6 +23,8 @@ Run: python3 test_digital_twin.py
 """
 
 import asyncio
+import json
+import math
 import os
 import socket
 import struct
@@ -32,16 +34,18 @@ import time
 
 import numpy as np
 
-from digital_twin import WEB, Twin, load_model, make_app, model_fk, T_LINK6_FLANGE
+from digital_twin import WEB, Twin, demo_pose_on_table, load_model, make_app, model_fk, T_LINK6_FLANGE
 from dobot_feedback import FIELDS, PACKET_SIZE, FeedbackError, FeedbackReader, pack_feedback, parse_feedback
-from dobot_tcp import DobotTCP
+from dobot_tcp import DobotError, DobotTCP
 from fake_dobot import FakeDobot
 from gripper import FakeGripper
 from manipulator_kinematics import SERVO_LIMITS_DEG, TableConstraint, fk, joint_map
-from mqtt_link import LocalBus
-from pick_runner import DEMO_T_CAMERA_OBJECT, start_fake_vision
+from mqtt_link import POSE_TOPIC, READY_TOPIC, LocalBus
+from pick_runner import start_fake_vision
 
 HOME = joint_map.home_servo_deg
+TOKEN = "test-token-123"
+CONFIG = {"sim": True, "robot": None, "table_z": 0.0, "detect": False, "max_speed": 100, "gripper": "simulated"}
 
 
 def wait_for(cond, timeout=10.0, what="condition"):
@@ -55,20 +59,23 @@ def wait_for(cond, timeout=10.0, what="condition"):
 class Harness:
     """A twin on a fake robot, in this process."""
 
-    def __init__(self, table_z=0.0, place=None, fake_vision=False, **fake_kw):
+    def __init__(self, table_z=0.0, place=None, fake_vision=False, gripper=None, sim=True, **fake_kw):
         self.fake = FakeDobot(enabled=fake_kw.pop("enabled", True), **fake_kw).start()
         self.robot = DobotTCP("127.0.0.1", self.fake.port, poll_s=0.01).connect()
         self.feedback = FeedbackReader("127.0.0.1", self.fake.feedback_port).start()
         self.feedback.wait_first()
-        link = LocalBus()
+        link = None
         if fake_vision:
-            start_fake_vision(link, DEMO_T_CAMERA_OBJECT, delay=0.05)
+            link = LocalBus()
+            start_fake_vision(link, demo_pose_on_table(table_z), delay=0.05)
         self.lines = []
-        self.twin = Twin(self.robot, self.feedback, FakeGripper(object_position=None), link, table_z=table_z,
-                         max_speed=100, place_xy=place, sim=True, log=self.lines.append)
+        self.gripper = gripper or FakeGripper(object_position=None)
+        self.twin = Twin(self.robot, self.feedback, self.gripper, link, table_z=table_z,
+                         max_speed=100, place_xy=place, sim=sim, log=self.lines.append)
         self.twin.fake = self.fake
         self.twin.check_model()
         self.twin.cmd_speed(100)
+        self.twin.cmd_set_object(xy=[-0.42, 0.12])   # as --sim starts
 
     def ok(self, cmd, **args):
         r = self.twin.handle({"cmd": cmd, **args})
@@ -82,6 +89,15 @@ class Harness:
 
     def idle(self, timeout=60):
         wait_for(lambda: self.twin.task is None, timeout, "the twin's task to end")
+        # and the feedback (what the browser sees) has caught up with the controller
+        wait_for(lambda: np.allclose(self.feedback.latest()["q_actual"], self.robot.get_angle(), atol=1e-3),
+                 2, "the feedback to settle")
+
+    def motions_after(self, name):
+        """MovJ / MovL the controller received after the last `name` command."""
+        names = [n for n, _, _ in self.fake.log]
+        last = max(i for i, n in enumerate(names) if n == name)
+        return [n for n in names[last + 1:] if n in ("MovJ", "MovL")]
 
     def joints(self):
         return np.array(self.twin.snapshot()["robot"]["joints"])
@@ -221,10 +237,19 @@ def test_twin_refuses_unsafe():
     h.ok("arm")
     h.refused("move_joints", "joint limits", joints=[-180, 160, -90, 0, 90, 90])
     h.refused("preview_joints", "joint limits", joints=[-180, 0, -170, 0, 90, 90])
+    # a full J5 turn whose gripper dips between coarse samples (found by the review)
+    A = np.array([-180, -16.47, -131.31, 40.54, -359.15, 90.0])
+    B = A.copy()
+    B[4] = 358.98
+    try:
+        h.twin.check_joint_move(A, B)
+        raise AssertionError("a wrist sweep under the table passed the check")
+    except Exception as e:
+        assert "below the table" in str(e), e
     low = below_table_target(h.twin.table_z)
     h.refused("move_joints", "below the table", joints=low.tolist())
     h.refused("preview_joints", "below the table", joints=low.tolist())
-    h.refused("jog_tool", "at most 100 mm", axis="z", delta=-150)
+    h.refused("jog_tool", "-100..100", axis="z", delta=-150)
     h.twin.table_z = 0.15      # tool tip 218 mm up: 100 mm lower would be under a table at 150 mm
     h.refused("jog_tool", "table", axis="z", delta=-100)
     h.twin.table_z = 0.0
@@ -373,11 +398,229 @@ def test_twin_detect():
     h.ok("detect")
     h.idle(30)
     s = h.twin.snapshot()
-    expect = (fk(np.zeros(6), "camera") @ DEMO_T_CAMERA_OBJECT)[:3, 3]
+    expect = np.array([-0.42, 0.12, 0.03])   # demo_pose_on_table: on the twin's table
     assert s["object"]["source"] == "camera" and np.allclose(np.array(s["object"]["T"])[:3, 3], expect, atol=1e-3)
     assert np.allclose(h.joints(), HOME, atol=0.3), "detect goes home first"
     h.close()
     print(f"OK: object from the camera at {np.round(expect, 4).tolist()}\n")
+
+
+class SlowGripper(FakeGripper):
+    """A gripper that takes a while to close, like the Feetech (0.25..3 s)."""
+
+    def close(self, speed=50):
+        time.sleep(0.8)
+        return super().close(speed)
+
+
+def test_stop_latches():
+    print("=" * 60)
+    print("STOP latches: during planning, during a gripper close, on disarm")
+    print("=" * 60)
+    # right after Pick, while the task thread still plans
+    h = Harness(place=[-0.25, 0.35])
+    h.ok("arm")
+    h.ok("pick")
+    h.ok("stop")
+    h.idle(30)
+    assert h.motions_after("Stop") == [], h.motions_after("Stop")
+    h.refused("move_joints", "not armed", joints=HOME.tolist())   # latched until Arm
+    h.close()
+
+    # while the gripper closes at the grasp: nothing after it
+    h = Harness(place=[-0.25, 0.35], gripper=SlowGripper(object_position=None))
+    h.ok("arm")
+    h.ok("pick")
+    wait_for(lambda: any("at grasp" in line for line in h.lines), 30, "the grasp")
+    time.sleep(0.2)   # inside the 0.8 s close
+    h.ok("stop")
+    h.idle(30)
+    after = h.motions_after("Stop")
+    assert after == [], after
+    assert not h.twin.armed and any("stopped" in line for line in h.lines)
+    h.close()
+
+    # switching Arm off while a move runs stops it too
+    h = Harness()
+    h.ok("arm")
+    h.ok("speed", value=5)
+    h.ok("move_joints", joints=(HOME + [60, 0, 0, 0, 0, 0]).tolist())
+    wait_for(lambda: h.fake.mode == 7, 2, "the move to start")
+    h.ok("arm", on=False)
+    h.idle(10)
+    assert abs(h.joints()[0] - (HOME[0] + 60)) > 5 and h.fake.mode == 5
+    h.ok("arm")   # Arm again clears the latch
+    h.ok("home")
+    h.idle()
+    h.close()
+    print("OK: no motion after STOP or disarm, even between moves; Arm re-arms\n")
+
+
+def test_auto_disarm():
+    print("=" * 60)
+    print("Disarm when the robot stops being the app's to move")
+    print("=" * 60)
+    h = Harness()
+    other = DobotTCP("127.0.0.1", h.fake.port).connect()   # the pendant / another program
+    cases = [("disabled", lambda: other.disable(), lambda: other.enable()),
+             ("drag mode", lambda: other.start_drag(), lambda: other.stop_drag()),
+             ("someone else's MovJ", lambda: other.mov_j(HOME + [30, 0, 0, 0, 0, 0], v=20), lambda: None),
+             ("pendant jog", lambda: h.fake.external_move(HOME, 0.6, wait=False), lambda: None)]
+    for what, do, undo in cases:
+        h.ok("arm")
+        do()
+        wait_for(lambda: not h.twin.armed, 2, f"disarm on {what}")
+        wait_for(lambda: h.fake.mode in (4, 5, 6), 5, "still")
+        undo()
+        wait_for(lambda: h.fake.mode == 5, 5, "idle again")
+    other.close()
+    # feedback gone (cable): disarm
+    h.ok("arm")
+    h.feedback.stop()
+    wait_for(lambda: not h.twin.armed, 2, "disarm without feedback")
+    h.robot.close()
+    h.fake.stop()
+    print("OK: disabled, drag mode, someone else's motion, pendant jog, lost feedback -> disarmed\n")
+
+
+def test_dropped_move():
+    print("=" * 60)
+    print("A move Stop() drops before it starts does not hang the wait")
+    print("=" * 60)
+    fake = FakeDobot(enabled=True, feedback=False).start()
+    a = DobotTCP("127.0.0.1", fake.port, poll_s=0.01).connect()
+    b = DobotTCP("127.0.0.1", fake.port).connect()   # someone else's Stop()
+    a.mov_j(HOME + [90, 0, 0, 0, 0, 0], v=5)          # long first move
+    second = a.mov_j(HOME, v=100)                     # queued behind it
+    time.sleep(0.2)
+    b.stop()
+    t0 = time.monotonic()
+    try:
+        a.wait_motion(second, lambda q: True)
+        raise AssertionError("waited for a move that was dropped")
+    except DobotError as e:
+        assert time.monotonic() - t0 < 5 and ("never started" in str(e) or "not at the target" in str(e)), e
+    # our own Stop() ends our own wait at once
+    cmd = a.mov_j(HOME + [90, 0, 0, 0, 0, 0], v=5)
+    threading.Timer(0.3, a.stop).start()
+    t0 = time.monotonic()
+    try:
+        a.wait_motion(cmd, lambda q: False)
+        raise AssertionError("not stopped")
+    except DobotError as e:
+        assert str(e).endswith(": stopped") and time.monotonic() - t0 < 0.8, (e, time.monotonic() - t0)
+    a.close()
+    b.close()
+    fake.stop()
+    print("OK: a dropped move is reported in seconds, our own Stop() at once\n")
+
+
+def test_bad_input():
+    print("=" * 60)
+    print("Bad input from a browser: refused, nothing breaks")
+    print("=" * 60)
+    h = Harness()
+    for cmd, args in [("arm", {"on": "false"}), ("set_place", {"xy": [float("nan"), 0.3]}),
+                      ("set_place", {"xy": [1]}), ("set_object", {"xy": {}}), ("set_object", {"xy": [0.1, 0.2], "diameter": 9}),
+                      ("speed", {"value": float("inf")}), ("jog_joint", {"joint": float("inf"), "delta": 5}),
+                      ("jog_joint", {"joint": True, "delta": 5}), ("move_joints", {"joints": [0] * 1000}),
+                      ("preview_pose", {"T": [[1, 0, 0]]}), ("detect", {}), ("no_such", {}), ("arm", {"bogus": 1})]:
+        r = h.twin.handle({"cmd": cmd, **args})
+        assert not r["ok"], (cmd, args, r)
+    assert not h.twin.armed and h.twin.place is None
+    json.dumps(h.twin.snapshot(), allow_nan=False)   # the state still serialises for every browser
+    h.close()
+    print("OK: NaN, wrong types and shapes, unknown commands all refused with a reply\n")
+
+
+def test_detect_safeguards():
+    print("=" * 60)
+    print("Detect: STOP ends the wait; a camera that moved is not trusted")
+    print("=" * 60)
+    h = Harness()                 # no vision link
+    h.ok("arm")
+    h.refused("detect", "no vision link")
+    h.close()
+    h = Harness()
+    h.twin.can_detect = True      # a link nobody answers on
+    h.ok("arm")
+    h.ok("detect", timeout=60)
+    wait_for(lambda: (h.twin.step or "").startswith("waiting"), 10, "the wait")
+    t0 = time.monotonic()
+    h.ok("stop")
+    h.idle(10)
+    assert time.monotonic() - t0 < 2
+    h.close()
+
+    h = Harness()
+    h.twin.can_detect = True
+    q0 = h.fake.joints.copy()
+    ready = h.twin.link.subscribe(READY_TOPIC)
+
+    def answer_late():   # the camera moved while it looked (no mode change: only the check sees it)
+        ready.get(timeout=10)
+        with h.fake.lock:
+            h.fake.joints = q0 + [8, 0, 0, 0, 0, 0]
+        time.sleep(0.05)
+        h.twin.link.publish(POSE_TOPIC, {"request_id": None, "T_camera_object": np.eye(4).tolist()})
+
+    threading.Thread(target=answer_late, daemon=True).start()
+    h.ok("arm")
+    h.ok("detect", timeout=20)
+    h.idle(30)
+    assert any("moved while the camera was looking" in line for line in h.lines), h.lines[-5:]
+    assert h.twin.snapshot()["object"]["source"] == "manual"
+    h.close()
+    print("OK: STOP ends a Detect wait at once; a pose from a moved camera is refused\n")
+
+
+def test_gripper_states():
+    print("=" * 60)
+    print("Gripper: opened before a pick; --no-gripper picks; a second close keeps the grip")
+    print("=" * 60)
+    h = Harness(place=[-0.25, 0.35])
+    h.ok("arm")
+    h.ok("gripper", action="close")      # on air
+    h.idle()
+    assert h.twin.grip["position"] == 255
+    motions = lambda: sum(n in ("MovJ", "MovL") for n, _, _ in h.fake.log)   # noqa: E731
+    before, opens, real_open = motions(), [], h.gripper.open
+    h.gripper.open = lambda *a, **k: (opens.append(motions()), real_open(*a, **k))
+    h.ok("pick")
+    h.idle(90)
+    assert opens and opens[0] == before, (opens, before)   # opened before the first motion of the pick
+    assert any("[placed] at [-0.25, 0.35]" in line for line in h.lines)
+    h.close()
+
+    h = Harness(sim=False)                # real arm, simulated gripper
+    h.ok("arm")
+    h.ok("pick")
+    h.idle(90)
+    s = h.twin.snapshot()
+    assert s["gripper"]["holding"] and s["object"]["attached"], s["gripper"]
+    h.ok("gripper", action="close")       # again, while holding
+    h.idle()
+    assert h.twin.snapshot()["object"]["attached"] and h.twin.grip["holding"]
+    h.refused("pick", "holding")
+    h.close()
+    print("OK: fingers opened before coming down; --no-gripper grips; holding survives a second close\n")
+
+
+def test_line_with_reading_noise():
+    print("=" * 60)
+    print("Straight-line moves are not refused for joint reading noise")
+    print("=" * 60)
+    h = Harness()
+    h.ok("arm")
+    T = fk(joint_map.servo_to_visual(h.robot.get_angle()), "tool")
+    from manipulator_kinematics import rot_x
+    T[:3, :3] = T[:3, :3] @ rot_x(math.radians(0.02))   # 0.02 deg off: noise, not a turn
+    T[2, 3] -= 0.02
+    h.ok("preview_pose", T=T.tolist(), linear=True)
+    T[:3, :3] = T[:3, :3] @ rot_x(math.radians(5))      # a real turn is still refused for a line
+    h.refused("preview_pose", "orientation", T=T.tolist(), linear=True)
+    h.close()
+    print("OK\n")
 
 
 # ============================================================
@@ -393,11 +636,17 @@ def test_websocket():
     config = {"sim": True, "robot": None, "table_z": 0.0, "detect": False, "max_speed": 100, "gripper": "simulated"}
 
     async def run():
-        async with TestClient(TestServer(make_app(h.twin, load_model(), config))) as client:
+        async with TestClient(TestServer(make_app(h.twin, load_model(), config, TOKEN))) as client:
             for path in ("/", "/web/app.js", "/web/vendor/three/three.module.min.js", "/web/model/nova2/Link1.STL"):
                 r = await client.get(path)
                 assert r.status == 200, (path, r.status)
-            ws = await client.ws_connect("/ws")
+            # no token, or a page from another site: denied
+            for kw in ({"path": "/ws"}, {"path": f"/ws?token={TOKEN}", "headers": {"Origin": "http://evil.example"}}):
+                bad = await client.ws_connect(kw["path"], headers=kw.get("headers"))
+                assert (await bad.receive_json())["type"] == "denied"
+                await bad.receive()
+                assert bad.close_code == 4003, bad.close_code
+            ws = await client.ws_connect(f"/ws?token={TOKEN}")
             hello = await ws.receive_json()
             assert hello["type"] == "hello" and len(hello["model"]["joints"]) == 6
             t0, states = time.monotonic(), 0
@@ -483,7 +732,7 @@ def test_browser():
         return
     h = Harness(place=[-0.25, 0.35])
     config = {"sim": True, "robot": None, "table_z": 0.0, "detect": False, "max_speed": 100, "gripper": "simulated"}
-    port, stop = serve_in_thread(make_app(h.twin, load_model(), config))
+    port, stop = serve_in_thread(make_app(h.twin, load_model(), config, TOKEN))
     shots = tempfile.mkdtemp(prefix="twin_")
     with sync_playwright() as p:
         kw = {"executable_path": chromium()} if chromium() else {}
@@ -491,7 +740,7 @@ def test_browser():
         page = browser.new_page(viewport={"width": 1280, "height": 800})
         errors = []
         page.on("pageerror", lambda e: errors.append(str(e)))
-        page.goto(f"http://127.0.0.1:{port}/")
+        page.goto(f"http://127.0.0.1:{port}/?token={TOKEN}")
         page.wait_for_function("window.twin && window.twin.meshesLoaded >= 7 && window.twin.state", timeout=30000)
 
         def scene_joints():
@@ -518,6 +767,23 @@ def test_browser():
         page.mouse.click(box["x"] + box["width"] * 0.5, box["y"] + box["height"] * 0.5)
         page.wait_for_function("window.twin.state.object && window.twin.state.object.source === 'manual'")
         page.screenshot(path=os.path.join(shots, "twin.png"))
+        # a joint field takes typing while the robot's state streams in
+        num = page.locator(".joint").nth(1).locator("input[type=number]")
+        num.click(click_count=3)
+        num.type("12.5", delay=80)
+        num.press("Enter")
+        page.wait_for_function("window.twin.state.ghost && Math.abs(window.twin.state.ghost[1] - 12.5) < 1e-6")
+        page.click("#joints-reset")
+        # a pick from the button that lasts well over the 3 s deadman: the page's keepalive covers it
+        page.evaluate("window.twin.send('set_object', {xy: [-0.42, 0.12]})")
+        page.evaluate("window.twin.send('speed', {value: 20})")
+        t0 = time.monotonic()
+        page.click("#pick")
+        page.wait_for_function("window.twin.state.task", timeout=5000)
+        page.wait_for_function("!window.twin.state.task", timeout=90000)
+        took = time.monotonic() - t0
+        assert took > 4 and any("[placed]" in line for line in h.lines), (took, h.lines[-6:])
+        assert not any("no browser heard" in line for line in h.lines)
         assert not errors, errors
         browser.close()
     stop()
@@ -534,5 +800,12 @@ if __name__ == "__main__":
     test_twin_stop()
     test_twin_pick_and_place()
     test_twin_detect()
+    test_stop_latches()
+    test_auto_disarm()
+    test_dropped_move()
+    test_bad_input()
+    test_detect_safeguards()
+    test_gripper_states()
+    test_line_with_reading_noise()
     test_websocket()
     test_browser()

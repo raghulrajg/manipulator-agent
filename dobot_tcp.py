@@ -95,15 +95,24 @@ class DobotTCP:
         self._buf = b""
         self._lock = threading.Lock()
         self._has_command_id = True
+        self.stops = 0      # Stop() calls so far: a move being waited for ends at the next one
 
     # ------------------------------------------------------------ connection
     def connect(self):
-        self.sock = socket.create_connection((self.ip, self.port), self.timeout)
-        self.sock.settimeout(self.timeout)
-        self._buf = b""
+        sock = socket.create_connection((self.ip, self.port), self.timeout)
+        sock.settimeout(self.timeout)
+        with self._lock:
+            if self.sock is not None:   # another thread got there first
+                sock.close()
+            else:
+                self.sock, self._buf = sock, b""
         return self
 
     def close(self):
+        with self._lock:
+            self._drop()
+
+    def _drop(self):
         if self.sock:
             self.sock.close()
             self.sock = None
@@ -121,9 +130,9 @@ class DobotTCP:
     def send(self, cmd):
         """Send one command, return the text inside its reply's {...}.
         Raises DobotError if ErrorID is not 0."""
-        if self.sock is None:
-            raise DobotError("not connected")
         with self._lock:
+            if self.sock is None:
+                raise DobotError(f"{cmd}: not connected")
             try:
                 self.sock.sendall(cmd.encode("ascii"))
                 while b";" not in self._buf:
@@ -132,7 +141,7 @@ class DobotTCP:
                         raise ConnectionError("connection closed by the robot")
                     self._buf = (self._buf + chunk).replace("；".encode(), b";")   # the guide shows both forms
             except OSError as e:
-                self.close()   # connected is False now; connect() again to go on
+                self._drop()   # connected is False now; connect() again to go on
                 raise DobotError(f"{cmd}: connection lost ({e})") from None
             reply, self._buf = self._buf.split(b";", 1)
         text = reply.decode("utf-8", errors="ignore")
@@ -204,7 +213,9 @@ class DobotTCP:
         self.send(f"SpeedFactor({int(percent)})")
 
     def stop(self):
-        """Stop the motion queue now."""
+        """Stop the motion queue now. A wait_motion() in progress ends with
+        DobotError('... stopped') even if its move had not started yet."""
+        self.stops += 1
         self.send("Stop()")
 
     def start_drag(self):
@@ -237,7 +248,11 @@ class DobotTCP:
         t0 = t_moved = time.monotonic()
         q_moved = None
         stopped_since = None
+        stops = self.stops
+        started = False      # seen running, or past this command's ID
         while True:
+            if self.stops != stops:
+                raise DobotError(f"{what}: stopped")
             mode = self.robot_mode()
             if mode in (MODE_ERROR, MODE_COLLISION):
                 raise DobotError(f"{what}: robot {MODE_NAMES[mode]} (alarms {self.error_ids()})", mode)
@@ -245,12 +260,16 @@ class DobotTCP:
                 raise DobotError(f"{what}: robot {MODE_NAMES[mode]} during the move", mode)
             cur = self.current_command_id()
             q = self.get_angle()
+            started = started or mode == MODE_RUNNING or (cur is not None and cur >= cmd_id)
             done = mode == MODE_IDLE and (cur is None or cur >= cmd_id)
             if done and reached(q):
                 return q
             now = time.monotonic()
             if q_moved is None or np.abs(q - q_moved).max() > 0.05:
                 t_moved, q_moved = now, q
+            if not started and cur is not None and mode == MODE_IDLE and now - t_moved > 1.5:
+                # idle, its ID never came up and nothing moves: the controller dropped it
+                raise DobotError(f"{what}: the robot never started this move (dropped by a Stop?)")
             if done and cur is not None:
                 # finished but not there: give the last reading a moment, then fail
                 stopped_since = stopped_since or now

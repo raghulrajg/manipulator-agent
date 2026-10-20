@@ -97,11 +97,11 @@ summary { cursor: pointer; font-weight: 650; padding: 4px 0; }
 .jog { display: flex; flex-wrap: wrap; gap: 4px; align-items: center; margin-top: 6px; }
 .jog button { padding: 3px 8px; }
 
-.joint { display: grid; grid-template-columns: 26px 1fr 64px 26px 26px; gap: 6px; align-items: center; margin: 5px 0; }
+.joint { display: grid; grid-template-columns: 26px 1fr 84px 26px 26px; gap: 6px; align-items: center; margin: 5px 0; }
 .joint .name { font-weight: 600; color: var(--muted); }
 .joint .actual { font-size: 11.5px; color: var(--muted); grid-column: 2 / 3; margin-top: -6px; }
 .joint input[type="range"] { width: 100%; }
-.joint input[type="number"] { width: 64px; }
+.joint input[type="number"] { width: 84px; }
 .joint button { padding: 2px 0; }
 .joint.edited input[type="number"] { border-color: var(--warn); }
 
@@ -124,4 +124,9 @@ summary { cursor: pointer; font-weight: 650; padding: 4px 0; }
   #view { height: 55vh; flex: none; }
   #panel { width: auto; border-left: 0; border-top: 1px solid var(--line); overflow: visible; }
   header { padding: 8px 16px; }
+  /* STOP always on screen, wherever the page is scrolled */
+  button.stop { position: fixed; right: 16px; bottom: 16px; z-index: 20; padding: 14px 26px; font-size: 17px;
+                box-shadow: 0 6px 20px rgb(0 0 0 / 45%); }
+  #armed-banner { position: fixed; left: 0; right: 0; top: 0; z-index: 19; }
+  #view-tools { top: auto; bottom: 10px; }
 }

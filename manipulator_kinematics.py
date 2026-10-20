@@ -391,13 +391,17 @@ class TableConstraint:
                 short = self.z + clearance - p[2]
                 if short > 1e-9 and self._over_table(p):
                     too_low[name] = max(too_low.get(name, 0.0), short)
-        return [f"{name} {short * 100:.1f} cm too low" for name, short in too_low.items()]
+        return [f"{name} {short * 100:.1f} cm too low" if short >= 0.001 else f"{name} {short * 1000:.2f} mm too low"
+                for name, short in too_low.items()]
 
     def path_violations(self, q_from, q_to, steps=20) -> List[str]:
         """The same check along the straight joint-space move q_from -> q_to
         (visual angles), i.e. the path a joint move such as Dobot MovJ takes.
+        Checked at `steps` points, and at least every 1 deg of the joint that
+        turns most (a long wrist turn would otherwise slip between samples).
         Empty list = clear; otherwise the violations at the first bad step."""
         q_from, q_to = np.asarray(q_from, dtype=float), np.asarray(q_to, dtype=float)
+        steps = max(int(steps), int(np.ceil(np.degrees(np.abs(q_to - q_from).max()) - 1e-9)))
         for t in np.linspace(0.0, 1.0, steps + 1)[1:]:
             bad = self.violations(q_from + t * (q_to - q_from))
             if bad:
