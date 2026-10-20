@@ -182,9 +182,10 @@ def test_dobot_faults():
 
 class FakeServo:
     """Feetech servo: moves 40 counts per read towards the goal, stops at
-    block_raw if an object is in the way."""
+    block_raw if an object is in the way. Closing is towards lower counts
+    (the gripper's defaults: 3052 open, 2048 closed)."""
 
-    def __init__(self, raw=2048, block_raw=None):
+    def __init__(self, raw=3052, block_raw=None):
         self.raw, self.goal, self.block_raw = raw, raw, block_raw
 
     def WritePosEx(self, scs_id, position, speed, acc):
@@ -194,13 +195,13 @@ class FakeServo:
     def ReadPos(self, scs_id):
         step = int(np.clip(self.goal - self.raw, -40, 40))
         new = self.raw + step
-        if self.block_raw is not None and step > 0:
-            new = min(new, self.block_raw)
+        if self.block_raw is not None and step < 0:
+            new = max(new, self.block_raw)
         self.raw = new
         return self.raw, 0, 0
 
     def ReadMoving(self, scs_id):
-        return int(self.raw != self.goal and not (self.block_raw is not None and self.raw >= self.block_raw)), 0, 0
+        return int(self.raw != self.goal and not (self.block_raw is not None and self.raw <= self.block_raw)), 0, 0
 
     def read2ByteTxRx(self, scs_id, address):
         return (1024 | 300) if self.raw == self.block_raw else 15, 0, 0   # bit 10 = direction
@@ -214,15 +215,15 @@ def test_gripper():
     print("gripper.py with a fake Feetech servo")
     print("=" * 60)
     g = FeetechGripper(connect=False)
-    assert g.to_raw(0) == 2048 and g.to_raw(255) == 3052 and g.from_raw(3052) == 255
+    assert g.to_raw(0) == 3052 and g.to_raw(255) == 2048 and g.from_raw(2048) == 255
     g.servo = FakeServo(block_raw=2600)
     r = g.close()
     assert r.holding and r.raw == 2600 and r.load == -300, r
     g.open()
-    assert g.servo.raw == 2048
+    assert g.servo.raw == 3052
     g.servo = FakeServo()
     r = g.close()
-    assert not r.holding and r.raw == 3052 and r.position == 255, r
+    assert not r.holding and r.raw == 2048 and r.position == 255, r
     for bad in (-1, 256):
         try:
             g.move(bad)

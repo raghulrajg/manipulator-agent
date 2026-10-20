@@ -61,7 +61,8 @@ class Harness:
 
     def __init__(self, table_z=0.0, place=None, fake_vision=False, gripper=None, sim=True, **fake_kw):
         self.fake = FakeDobot(enabled=fake_kw.pop("enabled", True), **fake_kw).start()
-        self.robot = DobotTCP("127.0.0.1", self.fake.port, poll_s=0.01).connect()
+        self.robot = DobotTCP("127.0.0.1", self.fake.port, poll_s=0.01, motion_port=self.fake.motion_port or 30003,
+                              protocol=self.fake.protocol).connect()
         self.feedback = FeedbackReader("127.0.0.1", self.fake.feedback_port).start()
         self.feedback.wait_first()
         link = None
@@ -640,6 +641,40 @@ def test_getpose_without_arguments():
     print("OK: arms and picks with the pendant on tool 0 or the 197 mm tool; refuses an unknown tool\n")
 
 
+def test_v3_protocol():
+    print("=" * 60)
+    print("V3 firmware: motion on port 30003, no Stop() / MovJ(joint=...)")
+    print("=" * 60)
+    h = Harness(protocol="v3", pose_args=False, command_id=False)
+    assert h.robot.protocol == "v3"
+    h.ok("arm")
+    start = h.joints()
+    h.ok("jog_joint", joint=0, delta=10)
+    h.idle(30)
+    assert abs(h.joints()[0] - start[0] - 10) < 0.05, h.joints()
+    h.ok("jog_tool", axis="z", delta=30)
+    h.idle(60)
+    names = [n for n, _, _ in h.fake.log]
+    assert "JointMovJ" in names and "SpeedJ" in names, names[-10:]
+    assert not any(n in ("MovJ", "MovL", "Stop") for n in names), [n for n in names if n in ("MovJ", "MovL", "Stop")]
+    h.ok("speed", value=5)
+    h.ok("move_joints", joints=(HOME + [90, 0, 0, 0, 0, 0]).tolist())
+    wait_for(lambda: h.fake.mode == 7, 5, "the move to start")
+    time.sleep(0.5)
+    h.ok("stop")
+    h.idle(10)
+    assert "ResetRobot" in [n for n, _, _ in h.fake.log] and h.fake.mode == 5 and not h.twin.armed
+    h.ok("arm")
+    h.ok("speed", value=100)
+    h.ok("home")
+    h.idle(60)
+    h.ok("pick")
+    h.idle(90)
+    assert any("at grasp" in line for line in h.lines), h.lines[-4:]
+    h.close()
+    print("OK: jog, straight line, STOP (ResetRobot) and pick over JointMovJ\n")
+
+
 # ============================================================
 # WEBSOCKET AND BROWSER
 # ============================================================
@@ -825,5 +860,6 @@ if __name__ == "__main__":
     test_gripper_states()
     test_line_with_reading_noise()
     test_getpose_without_arguments()
+    test_v3_protocol()
     test_websocket()
     test_browser()

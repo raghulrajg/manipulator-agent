@@ -360,6 +360,8 @@ DEMO_T_CAMERA_OBJECT = pose(np.eye(3), [0.03, -0.02, 0.38])   # 6 cm tomato, 38 
 def main():
     p = argparse.ArgumentParser(description="Pick the object the vision PC finds (MQTT -> IK -> Dobot -> gripper).")
     p.add_argument("--robot-ip", default=LEFT["robot_ip"])
+    p.add_argument("--protocol", choices=("auto", "v3", "v4"), default="auto",
+                   help="controller TCP protocol (auto: v3 if port 30003 is open)")
     p.add_argument("--arm", choices=("left", "right"),
                    help="which gripper: left = ID 21 on /dev/ttyUSB1, right = ID 22 on /dev/ttyUSB0 "
                    "(default: as x-trainer pairs them, 192.168.5.1 left, 192.168.5.2 right)")
@@ -420,11 +422,11 @@ def main():
     fake = None
     if args.dry_run:
         from fake_dobot import FakeDobot
-        fake = FakeDobot().start()
-        robot = DobotTCP("127.0.0.1", fake.port)
+        fake = FakeDobot(protocol="v3" if args.protocol == "v3" else "v4").start()
+        robot = DobotTCP("127.0.0.1", fake.port, motion_port=fake.motion_port or 30003, protocol=fake.protocol)
         gripper = FakeGripper()
     else:
-        robot = DobotTCP(args.robot_ip)
+        robot = DobotTCP(args.robot_ip, protocol=args.protocol)
         side = LEFT if args.arm == "left" else RIGHT
         port = args.gripper_port or side["port"]
         servo_id = side["servo_id"] if args.gripper_id is None else args.gripper_id

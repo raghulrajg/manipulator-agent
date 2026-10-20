@@ -17,8 +17,8 @@ digital twin aiohttp (and a browser).
 | `fk_from_joints.py` | Joint angles (servo deg, given or random) → flange, tool tip and camera poses; `--steps` prints every joint transform. |
 | `ik_from_pose.py` | Pose of the tool tip, flange or camera (4x4 or x y z), in the base frame or relative to an object → tool tip pose in the base frame and joint angles, each checked with FK. See "Pose → joint angles" below. |
 | `pick_runner.py` | **The real-time pick.** Sends "ready" over MQTT, takes the pose the vision PC sends back, plans with the IK and table check, drives the arm with Dobot MovJ / MovL, checks the target is reached (joints and the controller's own pose) before gripping, grips, lifts, places, goes home. See "Real-time pick on the robot" below. |
-| `dobot_tcp.py` | Nova 2 TCP/IP client (controller V4, port 29999, the guide in `Docs/`): enable, MovJ / MovL to joint targets, wait until done (queue ID, RobotMode, reached), GetAngle, GetPose, alarms. Run it alone to read the robot's state. |
-| `gripper.py` | Feetech SMS/STS gripper through `scservo_sdk/` (your SDK, unchanged), with x-trainer's settings: left arm (robot 192.168.5.1) ID 21 on /dev/ttyUSB1, right arm (192.168.5.2) ID 22 on /dev/ttyUSB0, raw 2048 open … 3052 closed. `close()` tells whether the fingers stopped on something. |
+| `dobot_tcp.py` | Nova 2 TCP/IP client (controller V4 on port 29999 as in the guide in `Docs/`, or V3 with motion on port 30003, detected automatically): enable, MovJ / MovL to joint targets, wait until done (queue ID, RobotMode, reached), GetAngle, GetPose, alarms. Run it alone to read the robot's state. |
+| `gripper.py` | Feetech SMS/STS gripper through `scservo_sdk/` (your SDK, unchanged), with x-trainer's settings: left arm (robot 192.168.5.1) ID 21 on /dev/ttyUSB1, right arm (192.168.5.2) ID 22 on /dev/ttyUSB0, raw 3052 open … 2048 closed (x-trainer's file has it the other way round; on this gripper 2048 is closed, `--open-raw` / `--closed-raw` change it). `close()` tells whether the fingers stopped on something. |
 | `scservo_sdk/` | Feetech's SCServo Python SDK (SMS/STS and SCSCL servos, port handler), your copy unchanged. `gripper.py` uses it; it needs pyserial. |
 | `mqtt_link.py` | Shared by both sides: topics, the ready / pose / status messages, the paho-mqtt client, and `PoseGate` (ready → found → still 2.5 s → send once). |
 | `foundationpose_mqtt.py` | Your FoundationPose tomato script with MQTT added: idle until "ready", then detect, track, wait until the pose has held 2.5 s, publish it once, idle again. Runs on the vision PC. |
@@ -107,6 +107,16 @@ included, can move the robot.
 
 **Safety**
 
+- **V3 controller protocol (Stop() -10000, MovJ(joint=...) -30001):**
+  older Nova 2 firmware, the one x-trainer drives, takes motion commands on
+  port 30003 (`JointMovJ(j1,...,j6)`) and has no `Stop()`.
+  `dobot_tcp.py` detects this when it connects: if port 30003 is open it
+  uses V3, so joint moves become SpeedJ / AccJ + JointMovJ and STOP becomes
+  `ResetRobot()`. A straight line (MovL) becomes JointMovJ steps 1 cm
+  apart along the line, each one checked like any other move. Use
+  `--protocol v3` or `--protocol v4` to force one (`--sim --protocol v3`
+  runs the fake controller in V3 mode). The protocol in use is printed at
+  start.
 - **Firmware without GetPose arguments:** some V4 firmware refuses
   `GetPose(user=0,tool=0)` with ErrorID -40001. The model check then uses
   plain `GetPose()`, which reports the tool selected on the pendant. It

@@ -223,6 +223,11 @@ class GuardedRobot:
         return self._wait(cmd_id, lambda q: np.abs(q - target).max() <= tol_deg, timeout, what)
 
     def move_l(self, servo_deg, reached, v=10, a=10, timeout=60.0, what="MovL"):
+        if self._robot.protocol == "v3":   # no MovL to joints: joint moves 1 cm apart, each through the gate
+            q = None
+            for wp in self._robot.line_waypoints(servo_deg):
+                q = self.move_j(wp, v, a, tol_deg=0.3, timeout=timeout, what=what)
+            return q
         cmd_id = self.mov_l(servo_deg, v, a)
         return self._wait(cmd_id, reached, timeout, what)
 
@@ -1095,11 +1100,14 @@ def build(args):
     fake = None
     if args.sim:
         from fake_dobot import FakeDobot
-        fake = FakeDobot(enabled=True).start()
+        fake = FakeDobot(enabled=True, protocol="v3" if args.protocol == "v3" else "v4").start()
         ip, port, feedback_port = "127.0.0.1", fake.port, fake.feedback_port
+        motion_port, protocol = fake.motion_port or 30003, fake.protocol
     else:
         ip, port, feedback_port = args.robot, 29999, 30004
-    robot = DobotTCP(ip, port).connect()
+        motion_port, protocol = 30003, args.protocol
+    robot = DobotTCP(ip, port, motion_port=motion_port, protocol=protocol).connect()
+    print(f"robot {ip}: TCP protocol {robot.protocol}")
     feedback = FeedbackReader(ip, feedback_port).start()
     feedback.wait_first(5.0)
 
@@ -1155,6 +1163,9 @@ def main():
     p.add_argument("--table-z", type=float, help="table surface height in the base frame [m] "
                    "(required with --robot; --sim default 0 = the robot stands on the table)")
     p.add_argument("--place", type=float, nargs=2, metavar=("X", "Y"), help="default place spot [m]")
+    p.add_argument("--protocol", choices=("auto", "v3", "v4"), default="auto",
+                   help="controller TCP protocol: v3 = motion on port 30003 (JointMovJ, ResetRobot), "
+                        "v4 = all on 29999 (MovJ(joint=...), Stop); auto (default) picks v3 if 30003 is open")
     p.add_argument("--max-speed", type=int, default=50, help="highest speed %% the app may use (default 50)")
     p.add_argument("--host", default="127.0.0.1", help="listen address (0.0.0.0 = whole network: anyone "
                    "with the printed address, token included, can move the robot)")

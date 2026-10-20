@@ -54,10 +54,18 @@ def _smooth(s):
 
 class FakeDobot:
     def __init__(self, joints=None, deg_per_s=NOVA2_DEG_PER_S, command_id=True, fault=None,
-                 feedback=True, enabled=False, pose_args=True, pendant_tool=None):
+                 feedback=True, enabled=False, pose_args=True, pendant_tool=None, protocol="v4"):
         """pose_args=False: GetPose(user=..,tool=..) is refused with -40001, as
         on some V4 firmware. pendant_tool: a 4x4 flange->tool transform for
-        the tool selected on the pendant (None = tool 0, the flange)."""
+        the tool selected on the pendant (None = tool 0, the flange).
+        protocol="v3": older firmware as on the Nova 2 x-trainer drives:
+        motions only as JointMovJ(j1,...,j6) on a separate motion port (like
+        30003) at the SpeedJ set on the dashboard; no Stop() (ResetRobot()),
+        RequestControl, GetCurrentCommandID or GetPose arguments."""
+        self.protocol = protocol
+        self.speed_j = 100
+        if protocol == "v3":
+            pose_args, command_id = False, False
         self.pose_args = pose_args
         self.pendant_tool = np.eye(4) if pendant_tool is None else np.asarray(pendant_tool, dtype=float)
         self.joints = np.array(joint_map.home_servo_deg if joints is None else joints, dtype=float)
@@ -78,6 +86,8 @@ class FakeDobot:
         self.port = self._server.getsockname()[1]
         self._feedback = self._listen() if feedback else None
         self.feedback_port = self._feedback.getsockname()[1] if feedback else None
+        self._motion_srv = self._listen() if protocol == "v3" else None
+        self.motion_port = self._motion_srv.getsockname()[1] if self._motion_srv else None
 
     @staticmethod
     def _listen():
@@ -91,6 +101,9 @@ class FakeDobot:
         threading.Thread(target=self._accept, args=(self._server, self._serve), daemon=True).start()
         if self._feedback:
             threading.Thread(target=self._accept, args=(self._feedback, self._stream), daemon=True).start()
+        if self._motion_srv:
+            threading.Thread(target=self._accept, args=(self._motion_srv, lambda c: self._serve(c, "motion")),
+                             daemon=True).start()
         threading.Thread(target=self._motion, daemon=True).start()
         return self
 
@@ -99,6 +112,8 @@ class FakeDobot:
         self._server.close()
         if self._feedback:
             self._feedback.close()
+        if self._motion_srv:
+            self._motion_srv.close()
 
     # ------------------------------------------------------------ outside world
     def external_move(self, joints, duration=0.5, wait=True):
@@ -138,7 +153,7 @@ class FakeDobot:
                 return
             threading.Thread(target=handler, args=(conn,), daemon=True).start()
 
-    def _serve(self, conn):
+    def _serve(self, conn, channel="dash"):
         buf = ""
         with conn:
             while not self._stop.is_set():
@@ -152,7 +167,7 @@ class FakeDobot:
                 while m := _CMD.match(buf):
                     buf = buf[m.end():]
                     try:
-                        conn.sendall(self.handle(m.group(1), m.group(2)).encode("ascii"))
+                        conn.sendall(self.handle(m.group(1), m.group(2), channel).encode("ascii"))
                     except OSError:
                         return
 
@@ -181,13 +196,42 @@ class FakeDobot:
             collision_state=int(mode == 11), current_command_id=cid)
 
     # ------------------------------------------------------------ commands
-    def handle(self, name, args):
+    def handle(self, name, args, channel="dash"):
         with self.lock:
             self.log.append((name, args, self.joints.copy()))
-            err, values = self._run(name, args)
+            err, values = self._run_motion_port(name, args) if channel == "motion" else self._run(name, args)
         return f"{err},{{{values}}},{name}({args});"
 
+    def _run_motion_port(self, name, args):
+        """V3 motion port: JointMovJ(j1,...,j6) only."""
+        if name != "JointMovJ":
+            return -10000, ""
+        if self.mode in (9, 11):
+            return -2, ""
+        if self.mode not in (5, 7):
+            return -1, ""
+        try:
+            target = np.array([float(x) for x in args.split(",")[:6]])
+        except ValueError:
+            return -30001, ""
+        if target.shape != (6,):
+            return -20000, ""
+        self.next_id += 1
+        self.queue.append((self.next_id, "MovJ", target, self.speed_j))
+        return 0, ""
+
     def _run(self, name, args):
+        if self.protocol == "v3":
+            if name in ("Stop", "RequestControl", "GetCurrentCommandID"):
+                return -10000, ""
+            if name == "ResetRobot":
+                name = "Stop"
+            if name in ("SpeedJ", "AccJ", "SpeedL", "AccL", "CP"):
+                if name == "SpeedJ":
+                    self.speed_j = max(1, min(100, int(float(args))))
+                return 0, ""
+            if name in ("MovJ", "MovL") and "joint=" in args:
+                return -30001, ""   # V3 MovJ takes x, y, z, rx, ry, rz
         if name == "RequestControl":
             return (-1, "") if self.mode == 7 else (0, "")
         if name == "ClearError":

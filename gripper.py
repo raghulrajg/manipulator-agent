@@ -7,7 +7,12 @@ x-trainer's DobotGripper (xtrainer_utils/dobot_control/gripper):
 
     left arm  (robot 192.168.5.1): servo ID 21 on /dev/ttyUSB1
     right arm (robot 192.168.5.2): servo ID 22 on /dev/ttyUSB0
-    raw position 2048 open, 3052 closed, 1 Mbaud
+    raw position 3052 open, 2048 closed, 1 Mbaud
+
+x-trainer's settings say 2048 open / 3052 closed, but on this hardware
+the servo is mounted the other way round (2048 is closed), so the
+defaults here are swapped. If open and close come out inverted on your
+gripper, pass --open-raw/--closed-raw (or open_raw=/closed_raw=).
 
 Positions are 0 (open) .. 255 (closed) and speeds 1..100 %, scaled to the
 servo's raw counts the way DobotGripper does. The torque limit (register
@@ -50,7 +55,7 @@ class GripResult:
 
 
 class FeetechGripper:
-    def __init__(self, port="/dev/ttyUSB1", servo_id=21, open_raw=2048, closed_raw=3052,
+    def __init__(self, port="/dev/ttyUSB1", servo_id=21, open_raw=3052, closed_raw=2048,
                  torque_limit=300, baudrate=1_000_000, empty_margin_raw=30, connect=True):
         """
         empty_margin_raw  fingers that stop closer than this to closed_raw
@@ -178,7 +183,7 @@ class FakeGripper:
         holding = self.object_position is not None
         self.position = self.object_position if holding else 255
         self.events.append("close")
-        return GripResult(holding=holding, position=self.position, raw=2048 + self.position * 4,
+        return GripResult(holding=holding, position=self.position, raw=3052 - self.position * 4,
                           load=250 if holding else 20)
 
     def disconnect(self):
@@ -193,11 +198,13 @@ def main():
     parser.add_argument("--port", help="override the arm's port")
     parser.add_argument("--id", type=int, help="override the arm's servo ID")
     parser.add_argument("--torque", type=int, default=300, help="torque limit 0..1000")
+    parser.add_argument("--open-raw", type=int, default=3052, help="servo counts when open (default 3052)")
+    parser.add_argument("--closed-raw", type=int, default=2048, help="servo counts when closed (default 2048)")
     args = parser.parse_args()
 
     side = LEFT if args.arm == "left" else RIGHT
     g = FeetechGripper(args.port or side["port"], side["servo_id"] if args.id is None else args.id,
-                       torque_limit=args.torque)
+                       open_raw=args.open_raw, closed_raw=args.closed_raw, torque_limit=args.torque)
     print(f"gripper: servo ID {g.servo_id} on {g.port}")
     try:
         print(f"now:   raw {g.read_raw()} (position {g.from_raw(g.read_raw())}/255)")
