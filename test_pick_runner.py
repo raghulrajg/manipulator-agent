@@ -414,7 +414,8 @@ def test_command_line():
     for args, why in ((["--robot-ip", "192.0.2.1"], "--table-z is required"),
                       (["--table-z", "-0.05", "--fake-vision", "demo"], "with --dry-run"),
                       (["--table-z", "-47"], "it is in meters"),
-                      (["--table-z", "-0.05", "--robot-ip", "192.0.2.1"], "pass --arm"),
+                      (["--table-z", "0.018", "--robot-ip", "192.0.2.1"], "pass --arm"),
+                      (["--table-z", "-0.10", "--robot-ip", "192.0.2.1"], "--pedestal"),
                       (["--table-z", "-0.05", "--cycles", "0"], "--cycles 1"),
                       (["--dry-run", "--speed", "0"], "1..100")):
         r = run_cli(*args)

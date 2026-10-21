@@ -62,6 +62,8 @@
       <details open>
         <summary>Tool tip <span class="muted small">(base frame)</span></summary>
         <div class="row"><span class="muted">FK</span><span id="tool-xyz" class="mono">—</span></div>
+        <div class="row"><span class="muted" title="The lowest point of the gripper and arm (model). Put the fingertips on the table: this z is the --table-z to start with">Lowest point</span><span id="lowest" class="mono">—</span></div>
+        <div class="row"><span class="muted" title="Lowest point above the table height the app was started with (--table-z). Near zero with the fingertips on the table, or the table height is wrong">Above table</span><span id="above-table" class="mono">—</span></div>
         <div class="row"><span class="muted" title="ToolVectorActual: the controller's own TCP, for the tool selected on the pendant (tool 0 = flange)">Controller TCP</span><span id="tcp-xyz" class="mono">—</span></div>
         <div class="jog">
           <span class="muted small">jog</span>

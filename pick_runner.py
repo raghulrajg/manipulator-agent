@@ -362,6 +362,8 @@ def main():
     p.add_argument("--robot-ip", default=LEFT["robot_ip"])
     p.add_argument("--protocol", choices=("auto", "v3", "v4"), default="auto",
                    help="controller TCP protocol (auto: v3 if port 30003 is open)")
+    p.add_argument("--pedestal", action="store_true",
+                   help="the robot stands on a pedestal, so the table is below its base (--table-z below -0.02)")
     p.add_argument("--arm", choices=("left", "right"),
                    help="which gripper: left = ID 21 on /dev/ttyUSB1, right = ID 22 on /dev/ttyUSB0 "
                    "(default: as x-trainer pairs them, 192.168.5.1 left, 192.168.5.2 right)")
@@ -401,6 +403,10 @@ def main():
     if args.table_z is not None and not -1.0 < args.table_z < home_tip_z - 0.05:
         p.error(f"--table-z {args.table_z} m is not between -1 m and 5 cm below the tool tip at home "
                 f"({home_tip_z:.3f} m): it is in meters")
+    if not args.dry_run and args.table_z < -0.02 and not args.pedestal:
+        p.error(f"--table-z {args.table_z} puts the table {-args.table_z * 100:.0f} cm below the robot's base "
+                "(z = 0 is the base's mounting face). If the robot stands on the table, the table is at about "
+                "0: measure it (README, 'Table height'). If it really stands on a pedestal, add --pedestal")
     for name in ("speed", "line_speed", "speed_factor"):
         value = getattr(args, name)
         if value is not None and not 1 <= value <= 100:

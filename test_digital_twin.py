@@ -675,6 +675,30 @@ def test_v3_protocol():
     print("OK: jog, straight line, STOP (ResetRobot) and pick over JointMovJ\n")
 
 
+def test_table_height_checks():
+    print("=" * 60)
+    print("Table height: lowest point, arming refuses an arm already below it, CLI guard")
+    print("=" * 60)
+    import subprocess
+    import sys
+    from manipulator_kinematics import lowest_point
+    z_home, part = lowest_point(joint_map.servo_to_visual(HOME))
+    h = Harness(table_z=z_home + 0.01)   # a table height above where the arm already is
+    assert abs(h.twin.snapshot()["robot"]["lowest"][0] - z_home) < 1e-3
+    h.refused("arm", "already below the table height")
+    h.close()
+    h = Harness(table_z=z_home - 0.06)
+    h.ok("arm")
+    h.close()
+    r = subprocess.run([sys.executable, "digital_twin.py", "--robot", "127.0.0.1", "--table-z", "-0.10"],
+                       capture_output=True, text=True, timeout=30)
+    assert r.returncode != 0 and "--pedestal" in r.stderr, r.stderr
+    r = subprocess.run([sys.executable, "pick_runner.py", "--robot-ip", "127.0.0.1", "--table-z", "-0.10"],
+                       capture_output=True, text=True, timeout=30)
+    assert r.returncode != 0 and "--pedestal" in r.stderr, r.stderr
+    print(f"OK: lowest point at home {z_home * 1000:.0f} mm ({part}); -0.10 without --pedestal refused\n")
+
+
 # ============================================================
 # WEBSOCKET AND BROWSER
 # ============================================================
@@ -861,5 +885,6 @@ if __name__ == "__main__":
     test_line_with_reading_noise()
     test_getpose_without_arguments()
     test_v3_protocol()
+    test_table_height_checks()
     test_websocket()
     test_browser()

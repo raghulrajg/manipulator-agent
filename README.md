@@ -71,8 +71,8 @@ and the robot follows the twin:
 
 ```
 python3 digital_twin.py --sim                                        # simulated robot; open the address it prints
-python3 digital_twin.py --robot 192.168.5.1 --table-z -0.05          # the real arm and its gripper
-python3 digital_twin.py --robot 192.168.5.1 --table-z -0.05 --mqtt   # + Detect with the vision PC
+python3 digital_twin.py --robot 192.168.5.1 --table-z 0.018          # the real arm and its gripper
+python3 digital_twin.py --robot 192.168.5.1 --table-z 0.018 --mqtt   # + Detect with the vision PC
 python3 digital_twin.py --sim --fake-vision demo                     # Detect answered with a demo pose
 python3 dobot_feedback.py --ip 192.168.5.1                           # just print the feedback (read only)
 ```
@@ -276,23 +276,39 @@ python3 gripper.py --arm left open                  # just open it (or: close)
 python3 gripper.py --arm left                       # test: open, close, open; says if it holds something
 python3 pick_runner.py --dry-run --fake-vision demo # fake robot, gripper and vision
 python3 pick_runner.py --dry-run                    # fake robot and gripper, your broker and vision PC
-python3 pick_runner.py --table-z -0.05 --speed 10   # first real pick: slow; holds it at home, ends
-python3 pick_runner.py --table-z -0.05 --place -0.25 0.40 --cycles 0   # pick and place, forever
-python3 pick_runner.py --robot-ip 192.168.5.2 --table-z -0.05          # right arm, its gripper (ID 22)
+python3 pick_runner.py --table-z 0.018 --speed 10   # first real pick: slow; holds it at home, ends
+python3 pick_runner.py --table-z 0.018 --place -0.25 0.40 --cycles 0   # pick and place, forever
+python3 pick_runner.py --robot-ip 192.168.5.2 --table-z 0.018          # right arm, its gripper (ID 22)
 ```
 
 Notes:
 
 - **`--table-z`** (required on the robot): the table surface in the base
-  frame, in meters. Measure it once: with tool 0 selected, jog the tool tip
-  onto the table, read the flange z and subtract 0.197 m (with the tool
-  pointing down the tip is 0.197 m below the flange). If the pendant shows
-  x-trainer's tool 1, it already reads the tip. A value that isn't between
-  −1 m and 5 cm below the tool tip at home is refused, which catches a
-  reading typed in mm. Only `--dry-run` may leave it out; it then estimates
-  the table as the tomato's centre minus half its diameter. The real robot
-  needs the measured value, because an estimate from the same camera pose
-  as the grasp would carry the same error.
+  frame, in meters. z = 0 is the robot base's mounting face, so a robot
+  standing on the table has its table at about 0, not below it. 0.018 in
+  the examples is what one setup measured; measure yours (see "Table
+  height" below). A value that isn't between −1 m and 5 cm below the tool
+  tip at home is refused, which catches a reading typed in mm, and a
+  value below −0.02 (table under the base) needs `--pedestal`. Only
+  `--dry-run` may leave it out; it then estimates the table as the
+  tomato's centre minus half its diameter. The real robot needs the
+  measured value, because an estimate from the same camera pose as the
+  grasp would carry the same error.
+- **Table height:** the table check is only as good as `--table-z`:
+  everything is kept above it (arm 5 cm, gripper 5 mm), and nothing else
+  knows where the table is. To measure it, put the fingertips on the table
+  with the gripper pointing down (drag mode, or jog slowly), then read
+  **Lowest point** in the twin's tool tip panel, or run
+  `python3 dobot_tcp.py --ip 192.168.5.1` ("lowest ... start with
+  --table-z ..."). Measuring with the same model the check uses also takes
+  care of fingers a little longer than the modelled 197 mm. Measure at two
+  or three places across the table; if they differ by more than a few mm
+  the table is not level in the robot's frame, so use the highest. In the
+  twin, **Above table** shows how far the lowest point is above the table
+  height you started with: with the fingertips on the table it should
+  read about 0. Arming refuses if the arm is already below that height.
+  Also set the controller's collision detection on the pendant, as a
+  second line of defence.
 - **Grasp point:** FoundationPose's tomato frame is its centre, because the mesh is
   centred on its bounding box. The tool tip goes to the centre
   (`--grasp-height 0`). For an object whose frame is its bottom

@@ -53,7 +53,7 @@ from dobot_tcp import MODE_IDLE, MODE_NAMES, DobotError, DobotTCP
 from gripper import LEFT, RIGHT, FakeGripper, GripperError
 from manipulator_kinematics import (
     SERVO_LIMITS_DEG, T_FLANGE_CAMERA, T_FLANGE_TOOL, IKError, TableConstraint, fk, ik_solutions,
-    joint_map, pose, rot_z,
+    joint_map, lowest_point, pose, rot_z,
 )
 from mqtt_link import LocalBus, MessageError
 from pick_runner import PickFailed, PickRunner, measured_flange, start_fake_vision
@@ -350,6 +350,7 @@ class Twin:
             "drag": int(s["drag_status"]), "queue": int(s["current_command_id"]),
             "speed_scaling": round(float(s["speed_scaling"]), 3), "robot_type": int(s["robot_type"]),
             "tool": T_tool.round(6).tolist(),
+            "lowest": [round(v, 4) if isinstance(v, float) else v for v in lowest_point(joint_map.servo_to_visual(q))],
         }
 
     def snapshot(self):
@@ -705,6 +706,10 @@ class Twin:
             self.check_model()
         if self.model_error_mm > 3.0:
             raise TwinError(f"the kinematic model is {self.model_error_mm:.1f} mm off the controller: not arming")
+        bad = self._table().violations(joint_map.servo_to_visual(self.robot.get_angle()))
+        if bad:   # the arm is where the table should be: the table height is wrong
+            raise TwinError(f"the arm is already below the table height {self.table_z:.3f} m ({', '.join(bad)}): "
+                            "check --table-z (put the fingertips on the table and read 'Lowest point')")
         with self.lock:
             if self.task is not None:
                 raise TwinError(f"busy: {self.task}")
@@ -1166,6 +1171,8 @@ def main():
     p.add_argument("--protocol", choices=("auto", "v3", "v4"), default="auto",
                    help="controller TCP protocol: v3 = motion on port 30003 (JointMovJ, ResetRobot), "
                         "v4 = all on 29999 (MovJ(joint=...), Stop); auto (default) picks v3 if 30003 is open")
+    p.add_argument("--pedestal", action="store_true",
+                   help="the robot stands on a pedestal, so the table is below its base (--table-z below -0.02)")
     p.add_argument("--max-speed", type=int, default=50, help="highest speed %% the app may use (default 50)")
     p.add_argument("--host", default="127.0.0.1", help="listen address (0.0.0.0 = whole network: anyone "
                    "with the printed address, token included, can move the robot)")
@@ -1184,6 +1191,10 @@ def main():
             p.error("--table-z is required with --robot")
         if args.fake_vision:
             p.error("--fake-vision is for --sim only")
+        if args.table_z < -0.02 and not args.pedestal:
+            p.error(f"--table-z {args.table_z} puts the table {-args.table_z * 100:.0f} cm below the robot's base "
+                    "(z = 0 is the base's mounting face). If the robot stands on the table, the table is at about "
+                    "0: measure it (README, 'Table height'). If it really stands on a pedestal, add --pedestal")
     elif args.table_z is None:
         args.table_z = 0.0
     if not 1 <= args.max_speed <= 100:

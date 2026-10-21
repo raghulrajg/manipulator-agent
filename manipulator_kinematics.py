@@ -351,6 +351,22 @@ _GRIPPER_BOXES = [((-0.0475, 0.0475), (-0.025, 0.025), (0.012, 0.097))] + \
 GRIPPER_CORNERS = [np.array([x, y, z, 1.0]) for b in _GRIPPER_BOXES for x, y, z in itertools.product(*b)]
 
 
+def lowest_point(q):
+    """The lowest point of the arm and gripper at visual angles q, as
+    (z [m] in the base frame, part name): what touches a table first.
+    Put the fingertips on the table and this z is the table's --table-z."""
+    _, _, cumulative = forward_kinematics_6dof(build_dh_params(q, "flange"))
+    flange = cumulative[-1]
+    o = [T[:3, 3] for T in cumulative]
+    points = [((flange @ c)[:3], "gripper") for c in GRIPPER_CORNERS]
+    points.append(((flange @ T_FLANGE_TOOL)[:3, 3], "gripper"))
+    points.append(((flange @ T_FLANGE_CAMERA)[:3, 3], "camera"))
+    for name, i in (("forearm", 1), ("wrist", 2), ("wrist", 3), ("wrist", 4), ("flange", 5)):
+        points.append((o[i], name))
+    p, name = min(points, key=lambda pn: pn[0][2])
+    return float(p[2]), name
+
+
 @dataclass
 class TableConstraint:
     """

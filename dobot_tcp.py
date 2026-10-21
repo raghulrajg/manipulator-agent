@@ -427,7 +427,7 @@ def main():
     args = parser.parse_args()
     np.set_printoptions(precision=3, suppress=True)
 
-    from manipulator_kinematics import fk, joint_map
+    from manipulator_kinematics import fk, joint_map, lowest_point
     with DobotTCP(args.ip, args.port) as robot:
         mode = robot.robot_mode()
         q = robot.get_angle()
@@ -439,6 +439,9 @@ def main():
               f"({'flange, tool 0' if robot.pose_tool == 0 else 'the tool selected on the pendant'})")
         print(f"model FK    {model} mm  -> differs by {np.linalg.norm(model - p[:3]):.2f} mm")
         print(f"GetErrorID  {robot.error_ids()}")
+        z, part = lowest_point(joint_map.servo_to_visual(q))
+        print(f"lowest      {z * 1000:.1f} mm ({part}): with the fingertips on the table, "
+              f"start with --table-z {z:.3f}")
 
 
 if __name__ == "__main__":

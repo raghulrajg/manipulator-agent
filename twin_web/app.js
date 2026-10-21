@@ -478,6 +478,10 @@ function onState(s) {
     });
     const T = r.tool;
     $('tool-xyz').textContent = `${mm(T[0][3])}, ${mm(T[1][3])}, ${mm(T[2][3])} mm`;
+    if (r.lowest) {
+      $('lowest').textContent = `z ${mm(r.lowest[0])} mm (${r.lowest[1]})`;
+      $('above-table').textContent = s.table_z == null ? '—' : `${mm(r.lowest[0] - s.table_z)} mm`;
+    }
     $('tcp-xyz').textContent = r.tcp ? `${r.tcp[0].toFixed(1)}, ${r.tcp[1].toFixed(1)}, ${r.tcp[2].toFixed(1)} mm` : '—';
   }
   $('drag').textContent = r.mode === 6 ? 'End drag' : 'Drag mode';
