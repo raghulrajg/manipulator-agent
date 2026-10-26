@@ -655,19 +655,19 @@ $('plan').addEventListener('click', () => act('plan'));
 $('pick').addEventListener('click', () => act('pick'));
 $('clear-plan').addEventListener('click', () => send('clear_plan'));
 $('detect').addEventListener('click', () => act('detect'));
-const cameraPosition = () => ['cam-x', 'cam-y', 'cam-z'].map((id) => Number($(id).value));
-const cameraOrientation = () => ['cam-qx', 'cam-qy', 'cam-qz', 'cam-qw'].map((id) => Number($(id).value));
-$('set-object-camera').addEventListener('click', async () => {
-  const r = await act('set_object_camera', {
-    position: cameraPosition(), orientation: cameraOrientation(), symmetric: $('cam-round').checked,
-    diameter: Number($('diameter').value) / 1000,
-  });
-  if (r.ok) {
-    const above = r.above_table_mm !== undefined ? `, centre ${r.above_table_mm} mm above the table` : '';
-    toast(`object at ${r.xyz.map((v) => (v * 1000).toFixed(1)).join(', ')} mm (base), turned ${r.yaw_deg}°, its z axis ${r.tilt_deg}° from straight up${above}`, 'info');
-  }
-});
-$('place-camera').addEventListener('click', () => act('place_at', { position: cameraPosition() }));
+// the tomato from FoundationPose's numbers (camera frame), live as they are typed
+const CAM_FIELDS = ['cam-x', 'cam-y', 'cam-z', 'cam-yaw'];
+async function tomatoFromCamera() {
+  const v = CAM_FIELDS.map((id) => $(id).value.trim());
+  if (v.some((x) => x === '' || !Number.isFinite(Number(x)))) return;
+  const r = await send('set_object_camera', { position: v.map(Number), diameter: Number($('diameter').value) / 1000 });
+  const status = $('cam-status');
+  status.classList.toggle('error', !r.ok);
+  if (!r.ok) { status.textContent = r.error; return; }
+  const above = r.above_table_mm !== undefined ? ` · centre ${r.above_table_mm} mm above the table` : '';
+  status.textContent = `tomato at ${r.xyz.map((x) => (x * 1000).toFixed(1)).join(', ')} mm (base)${above}`;
+}
+CAM_FIELDS.forEach((id) => $(id).addEventListener('input', () => throttle('cam', 100, tomatoFromCamera)));
 
 const raycaster = new THREE.Raycaster();
 let downAt = null;
@@ -694,6 +694,7 @@ const VIEWS = {
 };
 document.querySelectorAll('[data-view]').forEach((b) => b.addEventListener('click', () => {
   followCamera = false;
+  $('cam-panel').hidden = true;
   $('follow-cam').classList.remove('active');
   orbit.enabled = true;
   const v = VIEWS[b.dataset.view];
@@ -705,6 +706,7 @@ document.querySelectorAll('[data-view]').forEach((b) => b.addEventListener('clic
 }));
 $('follow-cam').addEventListener('click', () => {
   followCamera = !followCamera;
+  $('cam-panel').hidden = !followCamera;
   $('follow-cam').classList.toggle('active', followCamera);
   orbit.enabled = !followCamera;
   camera.fov = followCamera ? 42 : 45;   // RealSense colour stream, vertical

@@ -168,36 +168,27 @@ included, can move the robot.
   really is at it. A pick that misses goes back up and home, as on the
   robot.
 
-### Testing the vision agent: the object at FoundationPose's pose
+### Testing the vision agent: the tomato from FoundationPose's numbers
 
-Under **Pick & place**, **Object pose from the camera** takes the pose
-exactly as `foundationpose_mqtt.py` prints it:
-- **Position:** X, Y, Z in meters, in the wrist camera's frame (x right,
-  y down, z along the view).
-- **Quaternion (xyzw):** X, Y, Z, W, its orientation in the same frame.
+Press **Camera** (top right of the 3D view) to look through the wrist
+camera. A panel, **Tomato from FoundationPose**, appears at the bottom
+left. Type the object's pose as FoundationPose gives it, relative to the
+camera:
+- **x, y, z** in meters (x right, y down, z along the view);
+- **yaw** in degrees, a turn about the camera's view axis.
 
-**Set from camera** moves the twin's object to that position *and turns
-it* to that orientation, as seen from where the arm is now. The object
-shows its own axes (x red, y green, z blue), so you can see the rotation.
-It also reports:
-- the object's position in the base frame;
-- how far it is turned and tilted;
-- how high its centre is above the table. A 60 mm tomato lying on the
-  table should come out about 30 mm above it, so the gap shows how far off
-  the vision is.
+The tomato moves as you type, placed relative to the camera on the arm
+where the arm is now. Seen through the camera view it should land where
+the real tomato is in the real camera image. Under the inputs the panel
+shows:
+- where the tomato is in the base frame;
+- how high its centre is above the table. A 60 mm tomato on the table
+  should be about 30 mm above it, so the gap shows how far off the vision
+  is.
 
-**Round object** (on by default) makes the grasp ignore the rotation,
-which suits a tomato. A tomato's FoundationPose rotation is noise, and the
-vision script locks it by default. Untick it for an object whose rotation
-matters: the fingers then close across its x axis, as it is turned.
-
-**Place there** puts a held object down at the camera's x, y.
-
-Refused:
-- a position over 2 m (a value in mm);
-- a point behind the camera;
-- a quaternion that is not unit length;
-- any input while the arm is moving, because the camera moves with it.
+A value behind the camera (z ≤ 0), over 2 m (typed in mm), or entered
+while the arm is moving is shown there as an error. Leaving the Camera
+view hides the panel.
 
 **Live:** start the vision script with `TWIN_STREAM=1`
 (`TWIN_STREAM_HZ`, default 5) and it sends every tracked pose to the twin
