@@ -100,6 +100,19 @@
           <label class="small">Ø <input type="number" id="diameter" value="60" min="10" max="200" step="5"> mm</label>
           <button id="detect" title="Home, then ask the vision PC (MQTT)">Detect</button>
         </div>
+        <div class="camera-pos" title="The object as the vision agent measures it: in the wrist camera's frame (x right, y down, z along the view), seen from where the arm is now. w: turn about the view axis in degrees (a round object ignores it).">
+          <span class="muted small">Object seen by the camera (m, m, m, °)</span>
+          <div class="cam-inputs">
+            <label>x <input type="number" id="cam-x" value="0" step="0.005"></label>
+            <label>y <input type="number" id="cam-y" value="0" step="0.005"></label>
+            <label>z <input type="number" id="cam-z" value="0.30" step="0.005" min="0.01"></label>
+            <label>w <input type="number" id="cam-w" value="0" step="5"></label>
+          </div>
+          <div class="buttons">
+            <button id="set-object-camera">Set from camera</button>
+            <button id="place-camera" title="Put the held object down there (only x, y count: it goes on the table)">Place there</button>
+          </div>
+        </div>
         <div class="buttons">
           <button id="plan">Plan</button>
           <button id="pick" class="primary">Pick &amp; place</button>

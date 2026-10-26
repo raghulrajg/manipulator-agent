@@ -94,6 +94,10 @@ summary { cursor: pointer; font-weight: 650; padding: 4px 0; }
 .row { display: flex; justify-content: space-between; align-items: center; gap: 8px; margin: 4px 0; }
 .row input[type="range"] { flex: 1; }
 .buttons { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 8px; align-items: center; }
+.camera-pos { margin-top: 10px; }
+.cam-inputs { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 6px; margin-top: 4px; }
+.cam-inputs label { display: flex; align-items: center; gap: 3px; font-size: 12px; color: var(--muted); }
+.cam-inputs input { width: 100%; min-width: 0; }
 .jog { display: flex; flex-wrap: wrap; gap: 4px; align-items: center; margin-top: 6px; }
 .jog button { padding: 3px 8px; }
 

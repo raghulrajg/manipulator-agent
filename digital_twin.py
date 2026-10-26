@@ -55,8 +55,9 @@ from manipulator_kinematics import (
     SERVO_LIMITS_DEG, T_FLANGE_CAMERA, T_FLANGE_TOOL, IKError, TableConstraint, fk, ik_solutions,
     joint_map, lowest_point, pose, rot_z,
 )
-from mqtt_link import LocalBus, MessageError
-from pick_runner import PickFailed, PickRunner, measured_flange, start_fake_vision
+from mqtt_link import COMMAND_TOPIC, STATUS_TOPIC, LocalBus, MessageError, _position, camera_point_pose, parse_command
+from manipulator_agent import ManipulatorAgent, plan_place
+from pick_runner import Move, PickFailed, PickRunner, measured_flange, start_fake_vision
 
 WEB = Path(__file__).resolve().parent / "twin_web"
 URDF = WEB / "model" / "nova2" / "nova2_robot.urdf"
@@ -320,6 +321,9 @@ class Twin:
         self._tasks = queue.Queue()
         threading.Thread(target=self._worker, daemon=True, name="twin-tasks").start()
         threading.Thread(target=self._watch, daemon=True, name="twin-watch").start()
+        if link is not None:   # the vision agent's commands (and yours, by hand: mqtt_send.py)
+            self._commands = self.link.subscribe(COMMAND_TOPIC)
+            threading.Thread(target=self._command_loop, daemon=True, name="twin-mqtt-commands").start()
 
     # ------------------------------------------------------------ log / state
     def log(self, text, level="info"):
@@ -373,6 +377,73 @@ class Twin:
                 "plan": self.plan, "model_error_mm": self.model_error_mm, "sim": self.sim,
                 "can_detect": self.can_detect, "log_seq": self._log_seq,
             }
+
+    # ------------------------------------------------------------ MQTT commands
+    def _command_loop(self):
+        while True:
+            payload = self._commands.get()
+            try:
+                self.mqtt_command(payload)
+            except Exception as e:   # a bad message must not end the loop
+                self.log(f"MQTT command: unexpected {type(e).__name__}: {e}", "error")
+
+    def _publish_status(self, state, cmd, detail=""):
+        msg = {"state": state, "action": cmd.get("action"), "product": cmd.get("product", ""),
+               "detail": str(detail), "stamp": time.time()}
+        if cmd.get("request_id") is not None:
+            msg["request_id"] = cmd["request_id"]
+        try:
+            self.link.publish(STATUS_TOPIC, msg)
+        except Exception as e:
+            self.log(f"MQTT status not sent: {e}", "warn")
+
+    def mqtt_command(self, payload):
+        """One command from the vision agent (MQTT_COMMAND_TOPIC):
+        stop -> STOP; idle -> the object moves to position (nothing moves);
+        start pick -> object at position, pick it and hold it at home;
+        start place -> put the held object down at position.
+        Moving needs the twin armed in a browser, as from the page."""
+        gen = self.stop_gen   # as received: a STOP after this cancels it
+        try:
+            cmd = parse_command(payload)
+        except MessageError as e:
+            self.log(f"MQTT command refused: {e}", "warn")
+            self._publish_status("refused", {}, e)
+            return
+        what = " ".join(v for v in (cmd["state"], cmd["action"], cmd["product"]) if v)
+        where = "" if cmd["position"] is None else f" at {np.round(cmd['position'], 4).tolist()} (camera)"
+        self.log(f"MQTT command: {what}{where}")
+        if cmd["state"] == "stop":
+            self.request_stop()
+            self.cmd_stop()
+            self._publish_status("stopped", cmd)
+            return
+        position = None if cmd["position"] is None else cmd["position"].tolist()
+
+        def run(c):
+            r = self.handle(c, gen=gen, on_done=lambda state, detail: self._publish_status(state, cmd, detail))
+            if not r["ok"]:
+                self.log(f"MQTT {what}: {r['error']}", "warn")
+                self._publish_status("refused", cmd, r["error"])
+            return r
+
+        if cmd["state"] == "idle" or (cmd["action"] == "pick" and position is not None):
+            if position is not None:
+                r = run({"cmd": "set_object_camera", "position": position, "product": cmd["product"]})
+                if not r["ok"]:
+                    return
+                if cmd["state"] == "idle":
+                    self._publish_status("updated", cmd, f"object at {r['xyz']} (base frame)")
+            elif cmd["state"] == "idle":
+                self._publish_status("idle", cmd)
+            if cmd["state"] == "idle":
+                return
+        if cmd["action"] == "pick":
+            r = run({"cmd": "pick", "hold": True})
+        else:
+            r = run({"cmd": "place_at", "position": position})
+        if r["ok"]:
+            self._publish_status("accepted", cmd, r.get("queued", ""))
 
     # ------------------------------------------------------------ the gate
     def gate(self):
@@ -582,14 +653,15 @@ class Twin:
             if self._sent_before_stop():
                 raise TwinError("STOP was pressed after this command was sent: not run")
             self.task, self.step = name, None
-        self._tasks.put((name, fn, q_from))
+        self._tasks.put((name, fn, q_from, getattr(self._ctx, "on_done", None)))
         return {"queued": name}
 
     def _worker(self):
         while True:
-            name, fn, q_from = self._tasks.get()
+            name, fn, q_from, on_done = self._tasks.get()
             self.moved = False
             self.log(f"{name}: started")
+            result = ["failed", ""]
             try:
                 if self.cancel.is_set() or not self.armed:
                     raise Stopped("stopped before it started")
@@ -597,9 +669,12 @@ class Twin:
                     raise TwinError("the arm moved since this move was checked: try again")
                 fn()
                 self.log(f"{name}: done")
+                result = ["done", ""]
             except PickFailed as e:              # missed grip: back home, or nothing moved
                 self.log(f"{name}: {e}", "warn")
+                result[1] = str(e)
             except (IKError, TwinError) as e:
+                result[1] = str(e)
                 if self.moved or isinstance(e, Stopped):
                     if not self.cancel.is_set():
                         self._abort(f"{name}: {e}")
@@ -608,17 +683,26 @@ class Twin:
                 else:
                     self.log(f"{name}: {e}", "warn")   # refused before any motion
             except (DobotError, GripperError, OSError) as e:
+                result[1] = str(e)
                 if self.cancel.is_set() and "stopped" in str(e):
                     self.log(f"{name}: stopped", "warn")
                 else:
                     self._abort(f"{name}: {e}")
             except Exception as e:   # a bug must not kill the worker
+                result[1] = f"unexpected {type(e).__name__}: {e}"
                 self._abort(f"{name}: unexpected {type(e).__name__}: {e}")
             finally:
                 with self.lock:
                     self.task = None
                     self.ghost = None
                     self.plan = None
+                if self.cancel.is_set() and result[0] != "done":
+                    result[0] = "stopped"
+                if on_done is not None:
+                    try:
+                        on_done(*result)
+                    except Exception as e:
+                        self.log(f"{name}: reporting the result failed: {e}", "warn")
 
     def _speeds(self):
         self.runner.speed = self.speed
@@ -666,10 +750,12 @@ class Twin:
         return view
 
     # ------------------------------------------------------------ commands
-    def handle(self, cmd, gen=None):
-        """One command from a browser -> reply dict. Motions are queued; the
-        reply says whether they were accepted, the state shows the rest."""
+    def handle(self, cmd, gen=None, on_done=None):
+        """One command from a browser (or MQTT) -> reply dict. Motions are
+        queued; the reply says whether they were accepted, the state shows
+        the rest. on_done(state, detail) is called when a queued task ends."""
         self._ctx.gen = gen
+        self._ctx.on_done = on_done
         try:
             if not isinstance(cmd, dict):
                 raise TwinError("a command is a JSON object")
@@ -881,6 +967,40 @@ class Twin:
             self.plan = None
         return {}
 
+    def cmd_set_object_camera(self, position, product="", diameter=None):
+        """The object at [x, y, z, w] in the wrist camera's frame (meters; w:
+        turn about the view axis, degrees), seen from where the arm is now:
+        what the vision agent measures, put into the twin to check it."""
+        p = _position(position)
+        if not isinstance(product, str):
+            raise TwinError("product must be a string")
+        d = self.object_diameter if diameter is None else _num(diameter, "diameter", 0.01, 0.2)
+        with self.lock:
+            if self.task is not None:
+                raise TwinError(f"busy: {self.task} (the camera's view moves with the arm)")
+            if (self.object is not None and self.object["attached"]) or self.grip["holding"]:
+                raise TwinError("the gripper is holding the object")
+        state = self.robot_state()
+        if state.get("mode") == 7:
+            raise TwinError("the arm is moving: the camera's view moves with it")
+        q = self._joints_now()
+        T = fk(joint_map.servo_to_visual(q), "camera") @ camera_point_pose(p)
+        if max(abs(v) for v in T[:3, 3]) > 2.0:
+            raise TwinError("the object is more than 2 m from the robot")
+        with self.lock:
+            self.object = {"T": T, "diameter": d, "attached": False,
+                           "source": f"camera{': ' + product[:64] if product else ''}"}
+            self.plan = None
+        xyz = T[:3, 3]
+        reply = {"xyz": np.round(xyz, 4).tolist()}
+        detail = ""
+        if self.table_z is not None:
+            above = float(xyz[2] - self.table_z)
+            reply["above_table_mm"] = round(above * 1000, 1)
+            detail = f", centre {above * 1000:.0f} mm above the table (a {d * 1000:.0f} mm object on it: {d * 500:.0f})"
+        self.log(f"object from the camera {np.round(p[:3], 4).tolist()} m: base {np.round(xyz, 4).tolist()} m{detail}")
+        return reply
+
     def cmd_clear_object(self):
         with self.lock:
             if self.object is not None and self.object["attached"]:
@@ -900,19 +1020,80 @@ class Twin:
     def cmd_plan(self):
         return {"plan": self.plan_pick()}
 
-    def cmd_pick(self):
-        self.plan_pick()   # refuse now if it can't be done
+    def cmd_pick(self, hold=False):
+        """Pick the object, then place it at the place spot (if set) or,
+        with hold=True, keep holding it at home (MQTT action pick)."""
+        place = None if _bool(hold, "hold") else self.place
+        q_now = self._joints_now()
+        _, moves, _, _ = self.runner.plan(self._object_message(q_now), q_now, place)   # refuse now if it can't be done
+        with self.lock:
+            self.plan = self._plan_view(moves, q_now)
 
         def run():
             self.gripper.open()   # as pick_runner does: never come down on it with closed fingers
             q_now = self.robot.get_angle()
             msg = self._object_message(q_now)
-            _, moves, _, _ = self.runner.plan(msg, q_now, self.place)
+            _, moves, _, _ = self.runner.plan(msg, q_now, place)
             with self.lock:
                 self.plan = self._plan_view(moves, q_now)
             self._speeds()
-            self.runner.execute(moves, self.place)
-        return self._queue("pick and place" if self.place else "pick", run)
+            self.runner.execute(moves, place)
+        return self._queue("pick and place" if place else "pick", run)
+
+    def _place_moves(self, q_now, xy):
+        """Put the held object down with its centre at xy, on the table:
+        pre-place (MovJ), down (MovL), open, back up (MovL), home (MovJ)."""
+        with self.lock:
+            if not self.grip["holding"]:
+                raise TwinError("not holding anything to place")
+            obj = self.object if self.object is not None and self.object.get("attached") else None
+            T_tool_obj = obj["T_tool_obj"].copy() if obj else np.eye(4)
+            d = obj["diameter"] if obj else self.object_diameter
+        if self.table_z is None:
+            raise TwinError("no table height")
+        T_tool = fk(joint_map.servo_to_visual(q_now), "tool")
+        centre = (T_tool @ T_tool_obj)[:3, 3]
+        T_put = T_tool.copy()
+        T_put[:3, 3] += np.array([xy[0], xy[1], self.table_z + d / 2]) - centre
+        agent = ManipulatorAgent(table_z=self.table_z, **self.runner._agent_kwargs())
+        table = agent.table_for(np.eye(4))
+        try:
+            line = plan_place(agent, table, T_put, q_now)
+        except IKError as e:
+            raise TwinError(f"place spot {np.round(xy, 4).tolist()}: {e}") from None
+        (_, T_pre, q_pre), (_, T_down, q_down) = line[0], line[-1]
+        bad = table.path_violations(joint_map.servo_to_visual(q_pre), joint_map.servo_to_visual(self.home))
+        if bad:
+            raise TwinError("the way back home goes below the table: " + ", ".join(bad))
+        return [Move("pre_place", "movj", q_pre, T_pre),
+                Move("place", "movl", q_down, T_down, then="open"),
+                Move("retreat", "movl", q_pre, T_pre),
+                Move("home", "movj", self.home.copy(), fk(joint_map.servo_to_visual(self.home), "tool"))]
+
+    def cmd_place_at(self, position=None, xy=None):
+        """Put the held object down at xy (base frame, m) or at position
+        [x, y, z, w] in the camera's frame seen from where the arm is now
+        (only its x, y are used: it goes on the table)."""
+        if (position is None) == (xy is None):
+            raise TwinError("give position (camera frame) or xy (base frame)")
+        q_now = self._joints_now()
+        if position is not None:
+            xy = (fk(joint_map.servo_to_visual(q_now), "camera") @ camera_point_pose(_position(position)))[:2, 3].tolist()
+        xy = [float(v) for v in _vec(xy, 2, "xy")]
+        if max(abs(v) for v in xy) > 2.0:
+            raise TwinError("the place spot is more than 2 m from the robot")
+        moves = self._place_moves(q_now, xy)
+        with self.lock:
+            self.plan = self._plan_view(moves, q_now)
+
+        def run():
+            q = self.robot.get_angle()
+            moves = self._place_moves(q, xy)
+            with self.lock:
+                self.plan = self._plan_view(moves, q)
+            self._speeds()
+            self.runner.execute(moves, xy)
+        return self._queue("place", run, q_now)
 
     def cmd_detect(self, timeout=60.0):
         """Home, ready over MQTT, wait for the vision PC's pose, show the object."""

@@ -20,7 +20,8 @@ digital twin aiohttp (and a browser).
 | `dobot_tcp.py` | Nova 2 TCP/IP client (controller V4 on port 29999 as in the guide in `Docs/`, or V3 with motion on port 30003, detected automatically): enable, MovJ / MovL to joint targets, wait until done (queue ID, RobotMode, reached), GetAngle, GetPose, alarms. Run it alone to read the robot's state. |
 | `gripper.py` | Feetech SMS/STS gripper through `scservo_sdk/` (your SDK, unchanged), with x-trainer's settings: left arm (robot 192.168.5.1) ID 21 on /dev/ttyUSB1, right arm (192.168.5.2) ID 22 on /dev/ttyUSB0, raw 3052 open … 2048 closed (x-trainer's file has it the other way round; on this gripper 2048 is closed, `--open-raw` / `--closed-raw` change it). `close()` tells whether the fingers stopped on something. |
 | `scservo_sdk/` | Feetech's SCServo Python SDK (SMS/STS and SCSCL servos, port handler), your copy unchanged. `gripper.py` uses it; it needs pyserial. |
-| `mqtt_link.py` | Shared by both sides: topics, the ready / pose / status messages, the paho-mqtt client, and `PoseGate` (ready → found → still 2.5 s → send once). |
+| `mqtt_link.py` | Shared by both sides: topics, the ready / pose / status messages, the vision agent's commands (start / stop / idle, pick / place, position x y z w), the paho-mqtt client (EMQX: username, TLS, WebSocket), and `PoseGate` (ready → found → still 2.5 s → send once). |
+| `mqtt_send.py` | Send a command to the manipulator agent by hand, as the vision agent does, and print its replies. |
 | `foundationpose_mqtt.py` | Your FoundationPose tomato script with MQTT added: idle until "ready", then detect, track, wait until the pose has held 2.5 s, publish it once, idle again. Runs on the vision PC. |
 | `digital_twin.py` + `twin_web/` | **Digital twin**: a browser app with Dobot's own Nova 2 model that moves exactly as the robot does (real-time feedback) and moves the robot from the browser (checked MovJ / MovL, gripper, pick and place). `--sim` runs it on the fake controller. See "Digital twin" below. |
 | `dobot_feedback.py` | The controller's real-time feedback port (30004): the 1440-byte packet every 8 ms (actual joints, mode, tool pose, queue ID, drag state), parsed at the guide's byte offsets, read in a background thread. |
@@ -74,6 +75,8 @@ python3 digital_twin.py --sim                                        # simulated
 python3 digital_twin.py --robot 192.168.5.1 --table-z 0.018          # the real arm and its gripper
 python3 digital_twin.py --robot 192.168.5.1 --table-z 0.018 --mqtt   # + Detect with the vision PC
 python3 digital_twin.py --sim --fake-vision demo                     # Detect answered with a demo pose
+python3 digital_twin.py --sim --mqtt                                 # simulated robot, commands from your EMQX
+python3 mqtt_send.py start pick --position 0.02 -0.03 0.30 0         # send a command by hand (see below)
 python3 dobot_feedback.py --ip 192.168.5.1                           # just print the feedback (read only)
 ```
 
@@ -164,6 +167,83 @@ included, can move the robot.
 - **Simulation:** the fingers only close on the object if the tool tip
   really is at it. A pick that misses goes back up and home, as on the
   robot.
+
+### Testing the vision agent: object from camera coordinates
+
+Under **Pick & place**, **Object seen by the camera** takes the numbers
+the vision agent measures: x, y, z of the object in the wrist camera's
+frame, in meters (x right, y down, z along the view, as FoundationPose
+reports them), and w, the object's turn about the view axis in degrees (a
+round object ignores it). **Set from camera** puts the object where the
+camera says it is, seen from where the arm is now, and reports its
+position in the base frame and how high its centre is above the table. A
+60 mm tomato lying on the table should come out about 30 mm above it, so
+the gap shows how far off the vision is. **Place there** puts a held
+object down at the camera's x, y (z only fixes the point on the table).
+Positions over 2 m (a value in mm) or behind the camera are refused, and
+so is any input while the arm is moving, because the camera moves with it.
+
+### MQTT commands from the vision agent (EMQX)
+
+Started with `--mqtt`, the twin also listens on `manipulator/command`
+(`MQTT_COMMAND_TOPIC`) for commands like:
+
+```json
+{"state": "start", "product": "tomato", "action": "pick", "position": [0.02, -0.03, 0.30, 0]}
+```
+
+| state | action | what happens |
+|---|---|---|
+| `idle` (also `idal`) | — | Nothing moves. With a position, the object moves there in the twin. |
+| `start` | `pick` | The object goes to `position` (if given), then the arm picks it and holds it at home. |
+| `start` | `place` | The held object goes down at `position`'s x, y on the table, then the arm goes home. |
+| `stop` | — | STOP: the arm stops and the twin disarms. A bare `stop` payload works too. |
+
+- `position` is `[x, y, z, w]` in the camera frame as above (`[x, y, z]`,
+  `"x,y,z,w"` and `{"x": …, "y": …, "z": …, "w": …}` work too). It is
+  taken from where the arm is when the command arrives.
+- `product` is a label shown in the twin and sent back in the replies.
+- An optional `request_id` is echoed in the replies.
+- Replies go to `manipulator/status`: `{"state": "accepted" | "refused" |
+  "done" | "failed" | "stopped" | "updated" | "idle", "action", "product",
+  "detail", "stamp"}`.
+- **Safety:** commands that move the arm need **Arm** switched on in an
+  open twin page, the same as from the page itself, and the deadman still
+  applies. Without them a command is `refused`. `stop` always works.
+
+To send a command by hand:
+
+```
+python3 mqtt_send.py idle --position 0.02 -0.03 0.30 0                     # show the object in the twin
+python3 mqtt_send.py start pick --position 0.02 -0.03 0.30 0 --product tomato
+python3 mqtt_send.py start place --position -0.10 0.05 0.32 0
+python3 mqtt_send.py stop
+python3 mqtt_send.py --json '{"state":"start","product":"tomato","action":"pick","position":[0.02,-0.03,0.30,0]}'
+```
+
+`mqtt_send.py` prints the replies. Instead, you can paste the same JSON
+into the EMQX dashboard's WebSocket client or MQTTX, with topic
+`manipulator/command`, QoS 1, and subscribe to `manipulator/status`.
+
+**EMQX connection:** the agent, the twin, the vision script and
+`mqtt_send.py` all read the same environment variables:
+
+```
+export MQTT_BROKER_HOST=192.168.5.10       # your EMQX (or xxxx.emqxsl.com for EMQX Cloud)
+export MQTT_BROKER_PORT=1883               # 8883 = TLS
+export MQTT_USERNAME=...                   # if EMQX authentication is on
+export MQTT_PASSWORD=...
+export MQTT_TLS=1                          # on by itself on port 8883
+export MQTT_CA_FILE=/path/emqxsl-ca.crt    # EMQX Cloud's CA (from its console), for TLS
+export MQTT_TRANSPORT=websockets           # only for the WebSocket listener: port 8083 (8084 TLS), path /mqtt
+```
+
+- **Client IDs:** each client gets a random client ID suffix, because EMQX
+  disconnects the older of two clients that share an ID.
+- **Wrong credentials:** if EMQX refuses the connection, the error names
+  its reason, e.g. "Not authorized" or "Bad user name or password". Also
+  check the ACL if authorization is on: these clients publish and
+  subscribe to `manipulator/#`.
 
 **Model:**
 - **Arm:** the URDF chain the browser draws matches `manipulator_kinematics`

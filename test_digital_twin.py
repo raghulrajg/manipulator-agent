@@ -675,6 +675,109 @@ def test_v3_protocol():
     print("OK: jog, straight line, STOP (ResetRobot) and pick over JointMovJ\n")
 
 
+def camera_position(h, xyz_base, w=0.0):
+    """Where the wrist camera sees a base-frame point from where the arm is now: [x, y, z, w]."""
+    T_cam = fk(joint_map.servo_to_visual(h.robot.get_angle()), "camera")
+    p = np.linalg.inv(T_cam) @ np.array([*xyz_base, 1.0])
+    return [*p[:3].round(6).tolist(), w]
+
+
+def test_object_from_camera():
+    print("=" * 60)
+    print("Object at x, y, z, w in the camera frame (the vision agent's numbers)")
+    print("=" * 60)
+    h = Harness(place=[-0.25, 0.35])
+    r = h.ok("set_object_camera", position=camera_position(h, [-0.40, 0.10, 0.03]), product="tomato")
+    assert np.allclose(r["xyz"], [-0.40, 0.10, 0.03], atol=1e-4) and abs(r["above_table_mm"] - 30) < 0.1, r
+    obj = h.twin.snapshot()["object"]
+    assert obj["source"] == "camera: tomato" and np.allclose(np.array(obj["T"])[:3, 3], [-0.40, 0.10, 0.03], atol=1e-4)
+    for bad, why in (([0.1, 0.0, 300.0, 0], "meters"), ([0.0, 0.0, -0.2, 0], "in front of the camera"),
+                     ([0.0, 0.0], "position must be"), ([0, 0, "x", 0], "numbers"), ([0, 0, 0.3, 720], "degrees")):
+        h.refused("set_object_camera", why, position=bad)
+    h.ok("arm")
+    h.ok("pick")
+    h.idle(90)
+    assert any("[placed]" in line for line in h.lines)
+    h.close()
+    print("OK: the camera's numbers land the object where it is; mm, behind the camera and bad w refused\n")
+
+
+def test_mqtt_commands():
+    print("=" * 60)
+    print("MQTT commands from the vision agent: idle / start pick / start place / stop")
+    print("=" * 60)
+    from mqtt_link import COMMAND_TOPIC, STATUS_TOPIC, command_message, parse_command
+    h = Harness(fake_vision=True)
+    replies = h.twin.link.subscribe(STATUS_TOPIC)
+
+    def send(msg):
+        while not replies.empty():
+            replies.get_nowait()
+        h.twin.link.publish(COMMAND_TOPIC, msg)
+
+    def reply(*states, timeout=90):
+        end = time.monotonic() + timeout
+        while time.monotonic() < end:
+            try:
+                r = json.loads(replies.get(timeout=0.2))
+            except Exception:
+                continue
+            if "action" in r and r["state"] in states:   # the twin's replies, not the pick's own status
+                return r
+        raise AssertionError(f"no {states} reply")
+
+    # the message as written in the request, the "idal" spelling too
+    c = parse_command('{"state": "idal", "product": "", "action": "pick", "position": "0.02, -0.03, 0.30, 1"}')
+    assert c["state"] == "idle" and np.allclose(c["position"], [0.02, -0.03, 0.30, 1])
+    assert parse_command('{"state":"start","action":"pick","position":{"x":0,"y":0,"z":0.3}}')["position"][3] == 0
+
+    target = [-0.42, 0.12, 0.03]
+    send(command_message("idle", "pick", camera_position(h, target), "tomato"))
+    r = reply("updated", "refused", timeout=10)
+    assert r["state"] == "updated" and r["product"] == "tomato", r
+    assert np.allclose(np.array(h.twin.snapshot()["object"]["T"])[:3, 3], target, atol=1e-4)
+
+    send(command_message("start", "pick", camera_position(h, target), "tomato"))
+    r = reply("refused", "accepted", timeout=10)
+    assert r["state"] == "refused" and "not armed" in r["detail"], r
+
+    send('{"state": "start", "action": "jump"}')
+    assert "pick or place" in reply("refused", timeout=10)["detail"]
+    send({"state": "start", "action": "place"})
+    assert "needs a position" in reply("refused", timeout=10)["detail"]
+
+    h.ok("arm")
+    send({**command_message("start", "pick", camera_position(h, target), "tomato"), "request_id": "r1"})
+    assert reply("accepted", "refused", timeout=10)["state"] == "accepted"
+    r = reply("done", "failed", "stopped")
+    assert r["state"] == "done" and r["request_id"] == "r1", r
+    h.idle()
+    s = h.twin.snapshot()
+    assert s["gripper"]["holding"] and s["object"]["attached"] and np.allclose(h.joints(), HOME, atol=0.3)
+
+    place = [-0.25, 0.35]
+    send(command_message("start", "place", camera_position(h, [*place, 0.03]), "tomato"))
+    r = reply("accepted", "refused", timeout=10)
+    assert r["state"] == "accepted", r
+    assert reply("done", "failed", "stopped")["state"] == "done"
+    h.idle()
+    s = h.twin.snapshot()
+    T = np.array(s["object"]["T"])
+    assert not s["gripper"]["holding"] and np.allclose(T[:3, 3], [*place, 0.03], atol=0.002), T[:3, 3]
+
+    # stop: during a pick, the arm stops, the twin disarms, the sender hears "stopped"
+    h.ok("speed", value=5)
+    send(command_message("start", "pick", camera_position(h, [*place, 0.03]), "tomato"))
+    assert reply("accepted", "refused", timeout=10)["state"] == "accepted"
+    wait_for(lambda: h.fake.mode == 7, 5, "the pick to start moving")
+    send("stop")
+    assert reply("stopped", timeout=10)
+    h.idle(10)
+    assert not h.twin.armed and h.fake.mode == 5
+    h.close()
+    print("OK: idle shows the object, start pick / place run and report done, stop stops; bad ones refused\n")
+
+
 def test_table_height_checks():
     print("=" * 60)
     print("Table height: lowest point, arming refuses an arm already below it, CLI guard")
@@ -886,5 +989,7 @@ if __name__ == "__main__":
     test_getpose_without_arguments()
     test_v3_protocol()
     test_table_height_checks()
+    test_object_from_camera()
+    test_mqtt_commands()
     test_websocket()
     test_browser()

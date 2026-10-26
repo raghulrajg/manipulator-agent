@@ -651,6 +651,12 @@ $('plan').addEventListener('click', () => act('plan'));
 $('pick').addEventListener('click', () => act('pick'));
 $('clear-plan').addEventListener('click', () => send('clear_plan'));
 $('detect').addEventListener('click', () => act('detect'));
+const cameraPosition = () => ['cam-x', 'cam-y', 'cam-z', 'cam-w'].map((id) => Number($(id).value));
+$('set-object-camera').addEventListener('click', async () => {
+  const r = await act('set_object_camera', { position: cameraPosition(), diameter: Number($('diameter').value) / 1000 });
+  if (r.ok && r.above_table_mm !== undefined) toast(`object at ${r.xyz.map((v) => (v * 1000).toFixed(1)).join(', ')} mm (base), centre ${r.above_table_mm} mm above the table`, 'info');
+});
+$('place-camera').addEventListener('click', () => act('place_at', { position: cameraPosition() }));
 
 const raycaster = new THREE.Raycaster();
 let downAt = null;
