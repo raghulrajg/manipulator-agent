@@ -7,15 +7,18 @@ Same broker settings as the rest (MQTT_BROKER_HOST, MQTT_BROKER_PORT,
 MQTT_USERNAME, MQTT_PASSWORD, MQTT_TLS, MQTT_CA_FILE, MQTT_TRANSPORT) or
 the options below; works with EMQX, Mosquitto or any MQTT 3.1.1 broker.
 
-    python3 mqtt_send.py idle  --position 0.02 -0.03 0.30 0     # just show the object in the twin
-    python3 mqtt_send.py start pick  --position 0.02 -0.03 0.30 0 --product tomato
-    python3 mqtt_send.py start place --position -0.10 0.05 0.32 0
+    # FoundationPose's numbers: position x y z, quaternion x y z w
+    python3 mqtt_send.py idle  --position 0.02 -0.03 0.30 --orientation 0 0 0.38 0.92   # show it in the twin
+    python3 mqtt_send.py start pick  --position 0.02 -0.03 0.30 --orientation 0 0 0.38 0.92 --product tomato
+    python3 mqtt_send.py start place --position -0.10 0.05 0.32
     python3 mqtt_send.py stop
     python3 mqtt_send.py --json '{"state":"start","product":"tomato","action":"pick","position":[0.02,-0.03,0.30,0]}'
 
-position: x y z w in the wrist camera's frame (meters; x right, y down,
-z along the view, as FoundationPose), w the turn about the view axis in
-degrees. Moving needs the twin armed in a browser.
+position: x y z in the wrist camera's frame (meters; x right, y down, z
+along the view, as FoundationPose); orientation: the quaternion x y z w
+that foundationpose_mqtt.py prints. --position also takes 7 numbers
+(x y z qx qy qz qw), or 4 (x y z and a turn in degrees about the view
+axis). Moving needs the twin armed in a browser.
 
 The same JSON can be sent from the EMQX dashboard (WebSocket client),
 MQTTX or mosquitto_pub to the topic manipulator/command.
@@ -35,8 +38,12 @@ def main():
     p = argparse.ArgumentParser(description="Send a command to the manipulator agent over MQTT.")
     p.add_argument("state", nargs="?", choices=("start", "stop", "idle"))
     p.add_argument("action", nargs="?", choices=("pick", "place"))
-    p.add_argument("--position", type=float, nargs=4, metavar=("X", "Y", "Z", "W"),
-                   help="camera frame: x y z [m], w [deg]")
+    p.add_argument("--position", type=float, nargs="+", metavar="V",
+                   help="camera frame: x y z [m] (or x y z qx qy qz qw)")
+    p.add_argument("--orientation", type=float, nargs=4, metavar=("QX", "QY", "QZ", "QW"),
+                   help="camera frame quaternion, as FoundationPose prints it (xyzw)")
+    p.add_argument("--round", dest="symmetric", action="store_true", default=None,
+                   help="a round object: the grasp ignores its rotation")
     p.add_argument("--product", default="")
     p.add_argument("--json", help="send this JSON as it is instead")
     p.add_argument("--wait", type=float, default=10.0, help="print replies for this many seconds (default 10)")
@@ -51,7 +58,10 @@ def main():
     if args.json:
         text = args.json
     elif args.state:
-        text = json.dumps(command_message(args.state, args.action, args.position, args.product))
+        msg = command_message(args.state, args.action, args.position, args.product, args.orientation)
+        if args.symmetric:
+            msg["symmetric"] = True
+        text = json.dumps(msg)
     else:
         p.error("give a state (start / stop / idle) or --json")
     try:

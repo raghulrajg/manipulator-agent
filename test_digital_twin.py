@@ -692,14 +692,41 @@ def test_object_from_camera():
     obj = h.twin.snapshot()["object"]
     assert obj["source"] == "camera: tomato" and np.allclose(np.array(obj["T"])[:3, 3], [-0.40, 0.10, 0.03], atol=1e-4)
     for bad, why in (([0.1, 0.0, 300.0, 0], "meters"), ([0.0, 0.0, -0.2, 0], "in front of the camera"),
-                     ([0.0, 0.0], "position must be"), ([0, 0, "x", 0], "numbers"), ([0, 0, 0.3, 720], "degrees")):
+                     ([0.0, 0.0], "position must have"), ([0, 0, "x", 0], "numbers"), ([0, 0, 0.3, 720], "degrees")):
         h.refused("set_object_camera", why, position=bad)
+    h.refused("set_object_camera", "not a unit quaternion", position=[0, 0, 0.3], orientation=[0, 0, 0, 0.1])
+
+    # FoundationPose's pose: position + quaternion (xyzw, camera frame) -> the object takes both
+    from manipulator_kinematics import pose, rot_x, rot_z
+    from mqtt_link import matrix_quaternion
+    T_base = pose(rot_z(math.radians(40)) @ rot_x(math.radians(15)), [-0.41, 0.11, 0.03])
+    T_cam = np.linalg.inv(fk(joint_map.servo_to_visual(h.robot.get_angle()), "camera")) @ T_base
+    quat = matrix_quaternion(T_cam[:3, :3]).tolist()
+    for args in ({"position": T_cam[:3, 3].tolist(), "orientation": quat},
+                 {"position": T_cam[:3, 3].tolist() + quat}):                 # the 7-number form
+        r = h.ok("set_object_camera", **args)
+        T = np.array(h.twin.snapshot()["object"]["T"])
+        assert np.allclose(T, T_base, atol=1e-5), (T, T_base)
+        assert abs(r["yaw_deg"] - 40) < 0.1 and abs(r["tilt_deg"] - 15) < 0.1, r
+    assert h.twin.object["symmetric"] is False   # a real orientation: the grasp follows it
+
+    h.ok("set_object_camera", position=T_cam[:3, 3].tolist(), orientation=quat, symmetric=True)
     h.ok("arm")
     h.ok("pick")
     h.idle(90)
     assert any("[placed]" in line for line in h.lines)
+
+    # a turned (not round) object: the fingers close across its x axis, as it is turned
+    T_base = pose(rot_z(math.radians(30)), [-0.42, 0.12, 0.03])
+    T_cam = np.linalg.inv(fk(joint_map.servo_to_visual(h.robot.get_angle()), "camera")) @ T_base
+    h.ok("set_object_camera", position=T_cam[:3, 3].tolist(), orientation=matrix_quaternion(T_cam[:3, :3]).tolist())
+    grasp = next(m for m in h.ok("plan")["plan"]["moves"] if m["name"] == "grasp")
+    T_grasp = fk(joint_map.servo_to_visual(grasp["q"]), "tool")
+    yaw = math.degrees(math.atan2(T_grasp[1, 0], T_grasp[0, 0]))
+    assert min(abs((yaw - a + 180) % 360 - 180) for a in (30, 210)) < 1.0, yaw
     h.close()
-    print("OK: the camera's numbers land the object where it is; mm, behind the camera and bad w refused\n")
+    print("OK: position + quaternion put the object where and as FoundationPose sees it; "
+          "the grasp follows a turned object; mm, behind the camera, bad w / quaternion refused\n")
 
 
 def test_mqtt_commands():
@@ -729,7 +756,17 @@ def test_mqtt_commands():
     # the message as written in the request, the "idal" spelling too
     c = parse_command('{"state": "idal", "product": "", "action": "pick", "position": "0.02, -0.03, 0.30, 1"}')
     assert c["state"] == "idle" and np.allclose(c["position"], [0.02, -0.03, 0.30, 1])
-    assert parse_command('{"state":"start","action":"pick","position":{"x":0,"y":0,"z":0.3}}')["position"][3] == 0
+    assert parse_command('{"state":"start","action":"pick","position":{"x":0,"y":0,"z":0.3}}')["position"] == [0, 0, 0.3]
+
+    # FoundationPose's orientation over MQTT: the twin's object turns with it
+    from manipulator_kinematics import pose, rot_z
+    from mqtt_link import matrix_quaternion
+    T_base = pose(rot_z(math.radians(-50)), [-0.40, 0.10, 0.03])
+    T_cam = np.linalg.inv(fk(joint_map.servo_to_visual(h.robot.get_angle()), "camera")) @ T_base
+    send(command_message("idle", None, T_cam[:3, 3], "tomato", matrix_quaternion(T_cam[:3, :3])))
+    r = reply("updated", "refused", timeout=10)
+    assert r["state"] == "updated", r
+    assert np.allclose(np.array(h.twin.snapshot()["object"]["T"]), T_base, atol=1e-5)
 
     target = [-0.42, 0.12, 0.03]
     send(command_message("idle", "pick", camera_position(h, target), "tomato"))
@@ -748,7 +785,8 @@ def test_mqtt_commands():
 
     h.ok("arm")
     send({**command_message("start", "pick", camera_position(h, target), "tomato"), "request_id": "r1"})
-    assert reply("accepted", "refused", timeout=10)["state"] == "accepted"
+    r = reply("accepted", "refused", timeout=10)
+    assert r["state"] == "accepted", r
     r = reply("done", "failed", "stopped")
     assert r["state"] == "done" and r["request_id"] == "r1", r
     h.idle()
@@ -759,7 +797,8 @@ def test_mqtt_commands():
     send(command_message("start", "place", camera_position(h, [*place, 0.03]), "tomato"))
     r = reply("accepted", "refused", timeout=10)
     assert r["state"] == "accepted", r
-    assert reply("done", "failed", "stopped")["state"] == "done"
+    r = reply("done", "failed", "stopped")
+    assert r["state"] == "done", r
     h.idle()
     s = h.twin.snapshot()
     T = np.array(s["object"]["T"])
@@ -768,7 +807,8 @@ def test_mqtt_commands():
     # stop: during a pick, the arm stops, the twin disarms, the sender hears "stopped"
     h.ok("speed", value=5)
     send(command_message("start", "pick", camera_position(h, [*place, 0.03]), "tomato"))
-    assert reply("accepted", "refused", timeout=10)["state"] == "accepted"
+    r = reply("accepted", "refused", timeout=10)
+    assert r["state"] == "accepted", r
     wait_for(lambda: h.fake.mode == 7, 5, "the pick to start moving")
     send("stop")
     assert reply("stopped", timeout=10)

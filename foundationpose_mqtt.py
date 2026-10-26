@@ -23,7 +23,9 @@ ESC = exit.
 
 import queue
 import sys
+import os
 import time
+import uuid
 from pathlib import Path
 
 import cv2
@@ -33,8 +35,8 @@ import trimesh
 from scipy.spatial.transform import Rotation as Rot
 
 from mqtt_link import (
-    POSE_TOPIC, READY_TOPIC, RESEND_MAX_AGE, MessageError, MqttLink, PoseGate, parse_ready,
-    pose_message,
+    COMMAND_TOPIC, POSE_TOPIC, READY_TOPIC, RESEND_MAX_AGE, MessageError, MqttLink, PoseGate,
+    command_message, matrix_quaternion, parse_ready, pose_message,
 )
 
 # Vision only: no manipulator / IK code in this version. The pose goes to
@@ -356,6 +358,12 @@ def validate_mask_depth(mask, depth):
 # LOCK_ROTATION=True keeps the object axes parallel to the camera axes
 # so the IK target orientation is stable.
 LOCK_ROTATION = True
+
+# TWIN_STREAM=1: also send every tracked pose (position + quaternion, camera
+# frame) to the digital twin as an "idle" command, TWIN_STREAM_HZ a second,
+# so the object in the twin follows the real one. Nothing moves the arm.
+TWIN_STREAM = os.environ.get("TWIN_STREAM", "0").strip().lower() in ("1", "true", "yes", "on")
+TWIN_STREAM_HZ = float(os.environ.get("TWIN_STREAM_HZ", "5"))
 POS_ALPHA = 0.5   # 0..1, lower = smoother but more lag
 ROT_ALPHA = 0.3
 # Moves larger than this are real motion: follow them immediately
@@ -851,7 +859,8 @@ def main():
     )
 
     link = MqttLink(
-        client_id="foundationpose_vision"
+        # EMQX drops the older of two clients with one ID: keep each run's own
+        client_id=f"foundationpose_vision_{uuid.uuid4().hex[:6]}"
     )
 
     ready_queue = link.subscribe(
@@ -869,6 +878,14 @@ def main():
         f"MQTT ready: {link.host}:{link.port}, "
         f"ready on '{READY_TOPIC}', poses to '{POSE_TOPIC}'."
     )
+
+    last_streamed = -float("inf")
+
+    if TWIN_STREAM:
+        print(
+            f"Streaming the tracked pose to the twin on '{COMMAND_TOPIC}' "
+            f"({TWIN_STREAM_HZ:g} Hz, state idle)."
+        )
 
     # ========================================================
     # CAMERA
@@ -1814,6 +1831,25 @@ def main():
                     None if hold_pose else pose_matrix,
                     time.monotonic()
                 )
+
+                # The live pose to the twin (TWIN_STREAM=1): its object follows
+                if (
+                    TWIN_STREAM
+                    and pose_matrix is not None
+                    and not hold_pose
+                    and time.monotonic() - last_streamed >= 1.0 / TWIN_STREAM_HZ
+                ):
+                    last_streamed = time.monotonic()
+                    T_live = np.asarray(pose_matrix, dtype=float)
+                    stream = command_message(
+                        "idle",
+                        position=T_live[:3, 3],
+                        product="tomato",
+                        orientation=matrix_quaternion(T_live[:3, :3]),
+                    )
+                    # locked rotation = no real orientation to grip by
+                    stream["symmetric"] = bool(LOCK_ROTATION)
+                    link.publish(COMMAND_TOPIC, stream)
 
                 if T_send is not None:
 

@@ -20,7 +20,7 @@ digital twin aiohttp (and a browser).
 | `dobot_tcp.py` | Nova 2 TCP/IP client (controller V4 on port 29999 as in the guide in `Docs/`, or V3 with motion on port 30003, detected automatically): enable, MovJ / MovL to joint targets, wait until done (queue ID, RobotMode, reached), GetAngle, GetPose, alarms. Run it alone to read the robot's state. |
 | `gripper.py` | Feetech SMS/STS gripper through `scservo_sdk/` (your SDK, unchanged), with x-trainer's settings: left arm (robot 192.168.5.1) ID 21 on /dev/ttyUSB1, right arm (192.168.5.2) ID 22 on /dev/ttyUSB0, raw 3052 open … 2048 closed (x-trainer's file has it the other way round; on this gripper 2048 is closed, `--open-raw` / `--closed-raw` change it). `close()` tells whether the fingers stopped on something. |
 | `scservo_sdk/` | Feetech's SCServo Python SDK (SMS/STS and SCSCL servos, port handler), your copy unchanged. `gripper.py` uses it; it needs pyserial. |
-| `mqtt_link.py` | Shared by both sides: topics, the ready / pose / status messages, the vision agent's commands (start / stop / idle, pick / place, position x y z w), the paho-mqtt client (EMQX: username, TLS, WebSocket), and `PoseGate` (ready → found → still 2.5 s → send once). |
+| `mqtt_link.py` | Shared by both sides: topics, the ready / pose / status messages, the vision agent's commands (start / stop / idle, pick / place, position + quaternion), quaternion conversions, the paho-mqtt client (EMQX: username, TLS, WebSocket), and `PoseGate` (ready → found → still 2.5 s → send once). |
 | `mqtt_send.py` | Send a command to the manipulator agent by hand, as the vision agent does, and print its replies. |
 | `foundationpose_mqtt.py` | Your FoundationPose tomato script with MQTT added: idle until "ready", then detect, track, wait until the pose has held 2.5 s, publish it once, idle again. Runs on the vision PC. |
 | `digital_twin.py` + `twin_web/` | **Digital twin**: a browser app with Dobot's own Nova 2 model that moves exactly as the robot does (real-time feedback) and moves the robot from the browser (checked MovJ / MovL, gripper, pick and place). `--sim` runs it on the fake controller. See "Digital twin" below. |
@@ -76,7 +76,7 @@ python3 digital_twin.py --robot 192.168.5.1 --table-z 0.018          # the real 
 python3 digital_twin.py --robot 192.168.5.1 --table-z 0.018 --mqtt   # + Detect with the vision PC
 python3 digital_twin.py --sim --fake-vision demo                     # Detect answered with a demo pose
 python3 digital_twin.py --sim --mqtt                                 # simulated robot, commands from your EMQX
-python3 mqtt_send.py start pick --position 0.02 -0.03 0.30 0         # send a command by hand (see below)
+python3 mqtt_send.py idle --position 0.02 -0.03 0.30 --orientation 0 0 0.383 0.924   # the object at a pose (see below)
 python3 dobot_feedback.py --ip 192.168.5.1                           # just print the feedback (read only)
 ```
 
@@ -168,20 +168,41 @@ included, can move the robot.
   really is at it. A pick that misses goes back up and home, as on the
   robot.
 
-### Testing the vision agent: object from camera coordinates
+### Testing the vision agent: the object at FoundationPose's pose
 
-Under **Pick & place**, **Object seen by the camera** takes the numbers
-the vision agent measures: x, y, z of the object in the wrist camera's
-frame, in meters (x right, y down, z along the view, as FoundationPose
-reports them), and w, the object's turn about the view axis in degrees (a
-round object ignores it). **Set from camera** puts the object where the
-camera says it is, seen from where the arm is now, and reports its
-position in the base frame and how high its centre is above the table. A
-60 mm tomato lying on the table should come out about 30 mm above it, so
-the gap shows how far off the vision is. **Place there** puts a held
-object down at the camera's x, y (z only fixes the point on the table).
-Positions over 2 m (a value in mm) or behind the camera are refused, and
-so is any input while the arm is moving, because the camera moves with it.
+Under **Pick & place**, **Object pose from the camera** takes the pose
+exactly as `foundationpose_mqtt.py` prints it:
+- **Position:** X, Y, Z in meters, in the wrist camera's frame (x right,
+  y down, z along the view).
+- **Quaternion (xyzw):** X, Y, Z, W, its orientation in the same frame.
+
+**Set from camera** moves the twin's object to that position *and turns
+it* to that orientation, as seen from where the arm is now. The object
+shows its own axes (x red, y green, z blue), so you can see the rotation.
+It also reports:
+- the object's position in the base frame;
+- how far it is turned and tilted;
+- how high its centre is above the table. A 60 mm tomato lying on the
+  table should come out about 30 mm above it, so the gap shows how far off
+  the vision is.
+
+**Round object** (on by default) makes the grasp ignore the rotation,
+which suits a tomato. A tomato's FoundationPose rotation is noise, and the
+vision script locks it by default. Untick it for an object whose rotation
+matters: the fingers then close across its x axis, as it is turned.
+
+**Place there** puts a held object down at the camera's x, y.
+
+Refused:
+- a position over 2 m (a value in mm);
+- a point behind the camera;
+- a quaternion that is not unit length;
+- any input while the arm is moving, because the camera moves with it.
+
+**Live:** start the vision script with `TWIN_STREAM=1`
+(`TWIN_STREAM_HZ`, default 5) and it sends every tracked pose to the twin
+as an `idle` command (below), so the twin's object follows the real one
+while the arm is still. Nothing moves the arm.
 
 ### MQTT commands from the vision agent (EMQX)
 
@@ -189,41 +210,53 @@ Started with `--mqtt`, the twin also listens on `manipulator/command`
 (`MQTT_COMMAND_TOPIC`) for commands like:
 
 ```json
-{"state": "start", "product": "tomato", "action": "pick", "position": [0.02, -0.03, 0.30, 0]}
+{"state": "start", "product": "tomato", "action": "pick",
+ "position": [0.02, -0.03, 0.30], "orientation": [0.0, 0.0, 0.383, 0.924]}
 ```
 
 | state | action | what happens |
 |---|---|---|
-| `idle` (also `idal`) | — | Nothing moves. With a position, the object moves there in the twin. |
+| `idle` (also `idal`) | — | Nothing moves. With a position, the object moves (and turns) there in the twin. |
 | `start` | `pick` | The object goes to `position` (if given), then the arm picks it and holds it at home. |
 | `start` | `place` | The held object goes down at `position`'s x, y on the table, then the arm goes home. |
 | `stop` | — | STOP: the arm stops and the twin disarms. A bare `stop` payload works too. |
 
-- `position` is `[x, y, z, w]` in the camera frame as above (`[x, y, z]`,
-  `"x,y,z,w"` and `{"x": …, "y": …, "z": …, "w": …}` work too). It is
-  taken from where the arm is when the command arrives.
-- `product` is a label shown in the twin and sent back in the replies.
-- An optional `request_id` is echoed in the replies.
-- Replies go to `manipulator/status`: `{"state": "accepted" | "refused" |
-  "done" | "failed" | "stopped" | "updated" | "idle", "action", "product",
-  "detail", "stamp"}`.
+- **position:** `[x, y, z]` in the camera frame, meters. It also accepts:
+  - 7 numbers `[x, y, z, qx, qy, qz, qw]`, position and quaternion in one;
+  - 4 numbers `[x, y, z, w]`, with w a turn about the view axis in degrees;
+  - `"x,y,z"` or `{"x": …, "y": …, "z": …}`.
+
+  It is taken from where the arm is when the command arrives.
+- **orientation:** FoundationPose's quaternion `[qx, qy, qz, qw]`, scalar
+  last (`quaternion` and `{"x", "y", "z", "w"}` work too). Instead of
+  position and orientation you can send FoundationPose's 4x4 as
+  `"T_camera_object"`.
+- **symmetric** (optional): `true` makes the grasp ignore the rotation.
+  The default is `true` without an orientation and `false` with one.
+- **product:** a label shown in the twin and sent back in the replies.
+- **request_id** (optional): echoed in the replies.
+- **Replies:** they go to `manipulator/status`: `{"state": "accepted" |
+  "refused" | "done" | "failed" | "stopped" | "updated" | "idle",
+  "action", "product", "detail", "stamp"}`.
 - **Safety:** commands that move the arm need **Arm** switched on in an
   open twin page, the same as from the page itself, and the deadman still
   applies. Without them a command is `refused`. `stop` always works.
 
-To send a command by hand:
+To send a command by hand (FoundationPose's printed numbers: position,
+then quaternion):
 
 ```
-python3 mqtt_send.py idle --position 0.02 -0.03 0.30 0                     # show the object in the twin
-python3 mqtt_send.py start pick --position 0.02 -0.03 0.30 0 --product tomato
-python3 mqtt_send.py start place --position -0.10 0.05 0.32 0
+python3 mqtt_send.py idle --position 0.02 -0.03 0.30 --orientation 0 0 0.383 0.924   # show it in the twin
+python3 mqtt_send.py start pick --position 0.02 -0.03 0.30 --orientation 0 0 0.383 0.924 --product tomato
+python3 mqtt_send.py start pick --position 0.02 -0.03 0.30 --round                   # a tomato: rotation ignored
+python3 mqtt_send.py start place --position -0.10 0.05 0.32
 python3 mqtt_send.py stop
-python3 mqtt_send.py --json '{"state":"start","product":"tomato","action":"pick","position":[0.02,-0.03,0.30,0]}'
+python3 mqtt_send.py --json '{"state":"idle","position":[0.02,-0.03,0.30],"orientation":[0,0,0.383,0.924]}'
 ```
 
-`mqtt_send.py` prints the replies. Instead, you can paste the same JSON
-into the EMQX dashboard's WebSocket client or MQTTX, with topic
-`manipulator/command`, QoS 1, and subscribe to `manipulator/status`.
+`mqtt_send.py` prints the replies. You can also paste the same JSON into
+the EMQX dashboard's WebSocket client or MQTTX: publish to
+`manipulator/command` at QoS 1, and subscribe to `manipulator/status`.
 
 **EMQX connection:** the agent, the twin, the vision script and
 `mqtt_send.py` all read the same environment variables:

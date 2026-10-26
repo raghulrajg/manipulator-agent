@@ -279,5 +279,39 @@ def test_ready_settle_publish():
           f"again); registered at {est.registrations}; poses sent at frames {sent_at} (10 fps)\n")
 
 
+def test_quaternions():
+    """The quaternion <-> rotation conversions the twin uses for FoundationPose's
+    orientation, including 180-degree turns (w = 0), which a camera looking
+    straight down gives for an upright object."""
+    import itertools
+    import math
+    from mqtt_link import matrix_quaternion, quaternion_matrix
+    from manipulator_kinematics import rot_x, rot_z
+    print("=" * 60)
+    print("Quaternions (x, y, z, w) <-> rotations, 180-degree turns included")
+    print("=" * 60)
+    assert np.allclose(quaternion_matrix([0, 0, math.sin(math.pi / 4), math.cos(math.pi / 4)]), rot_z(math.pi / 2))
+    rotations = [rot_x(math.pi), rot_z(math.pi), rot_x(math.pi) @ rot_z(math.radians(30)),
+                 rot_x(math.pi) @ rot_z(math.radians(-150))]
+    # every axis permutation with signs that is a rotation (the 24 "square" turns)
+    for perm in itertools.permutations(range(3)):
+        for signs in itertools.product((1, -1), repeat=3):
+            R = np.zeros((3, 3))
+            for row, (col, sign) in enumerate(zip(perm, signs)):
+                R[row, col] = sign
+            if np.linalg.det(R) > 0:
+                rotations.append(R)
+    rng = np.random.default_rng(3)
+    for _ in range(2000):
+        q = rng.normal(size=4)
+        rotations.append(quaternion_matrix(q / np.linalg.norm(q)))
+    for R in rotations:
+        q = matrix_quaternion(R)
+        assert np.isclose(np.linalg.norm(q), 1) and q[3] >= 0, q
+        assert np.allclose(quaternion_matrix(q), R, atol=1e-9), (R, q)
+    print(f"OK: {len(rotations)} rotations round-trip, 180-degree turns and the 24 square turns included\n")
+
+
 if __name__ == "__main__":
     test_ready_settle_publish()
+    test_quaternions()

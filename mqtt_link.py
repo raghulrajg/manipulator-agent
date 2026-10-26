@@ -14,11 +14,15 @@ and the arm (pick_runner.py). Copy this file next to foundationpose_mqtt.py.
 
     vision agent (or you, by hand) -> MQTT_COMMAND_TOPIC
               {"state": "start" | "stop" | "idle", "product": "tomato",
-               "action": "pick" | "place", "position": [x, y, z, w]}
+               "action": "pick" | "place", "position": [x, y, z],
+               "orientation": [qx, qy, qz, qw]}
               position: the object (pick) or the spot to put it (place) in
               the wrist camera's frame, meters (x right, y down, z along
-              the view, as FoundationPose); w: its turn about the vertical
-              in degrees, ignored for a round object. See parse_command().
+              the view, as FoundationPose); orientation: its rotation as
+              FoundationPose gives it (quaternion, scalar last). Also
+              position [x, y, z, qx, qy, qz, qw], or [x, y, z, w] with w a
+              turn about the view axis in degrees, or "T_camera_object"
+              (4x4). See parse_command().
     arm    -> MQTT_STATUS_TOPIC {"state", "action", "product", "detail", "stamp"}
               for each command: accepted / refused / done / failed / stopped
 
@@ -138,32 +142,106 @@ COMMAND_ACTIONS = ("pick", "place")
 _STATE_SPELLINGS = {"idal": "idle", "idel": "idle"}
 
 
-def _position(value):
-    """[x, y, z(, w)], {"x", "y", "z"(, "w")} or "x,y,z(,w)" -> 4 floats (w 0 if left out)."""
+def _numbers(value, what, sizes):
+    """[...], {"x", "y", "z"(, "w")} or "a, b, c" -> floats, with len in sizes."""
     if isinstance(value, str):
-        value = [v for v in value.replace(",", " ").split()]
+        value = value.replace(",", " ").split()
     elif isinstance(value, dict):
         try:
             value = [value[k] for k in ("x", "y", "z")] + ([value["w"]] if "w" in value else [])
         except KeyError as e:
-            raise MessageError(f"position needs x, y and z (missing {e})") from None
-    if not isinstance(value, (list, tuple)) or len(value) not in (3, 4) or \
+            raise MessageError(f"{what} needs x, y and z (missing {e})") from None
+    if not isinstance(value, (list, tuple, np.ndarray)) or len(value) not in sizes or \
             any(isinstance(v, bool) for v in value):
-        raise MessageError("position must be [x, y, z, w] (or x, y, z)")
+        raise MessageError(f"{what} must have {' or '.join(map(str, sizes))} numbers")
     try:
-        p = np.array([float(v) for v in value] + [0.0] * (4 - len(value)))
+        v = np.array([float(x) for x in value])
     except (TypeError, ValueError):
-        raise MessageError("position must be numbers") from None
-    if not np.all(np.isfinite(p)):
-        raise MessageError("position must be finite numbers")
-    if np.linalg.norm(p[:3]) > 2.0:
-        raise MessageError(f"position {p[:3].tolist()} is more than 2 m from the camera: it is in meters, "
+        raise MessageError(f"{what} must be numbers") from None
+    if not np.all(np.isfinite(v)):
+        raise MessageError(f"{what} must be finite numbers")
+    return v
+
+
+def _quaternion(value, what="orientation"):
+    """[qx, qy, qz, qw] (scalar last, as scipy and foundationpose_mqtt.py
+    print it) -> the same, normalised."""
+    q = _numbers(value, what, (4,))
+    n = float(np.linalg.norm(q))
+    if not 0.9 < n < 1.1:
+        raise MessageError(f"{what} {q.tolist()} is not a unit quaternion [x, y, z, w] (its length is {n:.3f})")
+    return q / n
+
+
+def _position(value):
+    """The position part of a command -> (x, y, z, w_deg, quaternion or None).
+      [x, y, z]                       position only
+      [x, y, z, w]                    + turn w [deg] about the camera's view axis
+      [x, y, z, qx, qy, qz, qw]       + FoundationPose's orientation (quaternion)
+    Also as "x,y,z,..." or {"x", "y", "z"(, "w")}."""
+    v = _numbers(value, "position", (3, 4, 7))
+    if np.linalg.norm(v[:3]) > 2.0:
+        raise MessageError(f"position {v[:3].tolist()} is more than 2 m from the camera: it is in meters, "
                            "not mm")
-    if p[2] <= 0.0:
-        raise MessageError(f"position z {p[2]} must be in front of the camera (z > 0, along the view)")
-    if abs(p[3]) > 360:
-        raise MessageError(f"w {p[3]} is a turn in degrees: -360..360")
-    return p
+    if v[2] <= 0.0:
+        raise MessageError(f"position z {v[2]} must be in front of the camera (z > 0, along the view)")
+    if len(v) == 7:
+        return (*v[:3], 0.0, _quaternion(v[3:], "position's quaternion"))
+    w = float(v[3]) if len(v) == 4 else 0.0
+    if abs(w) > 360:
+        raise MessageError(f"w {w} is a turn in degrees: -360..360 (an orientation goes in 'orientation')")
+    return (*v[:3], w, None)
+
+
+def quaternion_matrix(q):
+    """[qx, qy, qz, qw] -> 3x3 rotation."""
+    x, y, z, w = (float(v) for v in q)
+    return np.array([[1 - 2 * (y * y + z * z), 2 * (x * y - z * w), 2 * (x * z + y * w)],
+                     [2 * (x * y + z * w), 1 - 2 * (x * x + z * z), 2 * (y * z - x * w)],
+                     [2 * (x * z - y * w), 2 * (y * z + x * w), 1 - 2 * (x * x + y * y)]])
+
+
+def matrix_quaternion(R):
+    """3x3 rotation -> [qx, qy, qz, qw]."""
+    # Shepperd: divide by the largest of w, x, y, z, so 180-degree turns
+    # (w = 0, e.g. a camera looking straight down) come out right
+    R = np.asarray(R, dtype=float)
+    trace = R[0, 0] + R[1, 1] + R[2, 2]
+    i = int(np.argmax([trace, R[0, 0], R[1, 1], R[2, 2]]))
+    if i == 0:
+        s = 2 * np.sqrt(1 + trace)
+        q = [(R[2, 1] - R[1, 2]) / s, (R[0, 2] - R[2, 0]) / s, (R[1, 0] - R[0, 1]) / s, s / 4]
+    elif i == 1:
+        s = 2 * np.sqrt(1 + R[0, 0] - R[1, 1] - R[2, 2])
+        q = [s / 4, (R[0, 1] + R[1, 0]) / s, (R[0, 2] + R[2, 0]) / s, (R[2, 1] - R[1, 2]) / s]
+    elif i == 2:
+        s = 2 * np.sqrt(1 - R[0, 0] + R[1, 1] - R[2, 2])
+        q = [(R[0, 1] + R[1, 0]) / s, s / 4, (R[1, 2] + R[2, 1]) / s, (R[0, 2] - R[2, 0]) / s]
+    else:
+        s = 2 * np.sqrt(1 - R[0, 0] - R[1, 1] + R[2, 2])
+        q = [(R[0, 2] + R[2, 0]) / s, (R[1, 2] + R[2, 1]) / s, s / 4, (R[1, 0] - R[0, 1]) / s]
+    q = np.array(q)
+    q /= np.linalg.norm(q)
+    return q if q[3] >= 0 else -q   # q and -q are the same turn: the one with w >= 0
+
+
+def camera_pose(position, orientation=None):
+    """The object's pose in the camera frame from a command's numbers ->
+    (4x4 T_camera_object, whether it carries a real orientation).
+    orientation [qx, qy, qz, qw] (FoundationPose's rotation) wins over a
+    quaternion or w inside position; with neither the object is upright
+    as the camera sees it."""
+    x, y, z, w, q = _position(position)
+    if orientation is not None and not (isinstance(orientation, (list, tuple, str, dict)) and len(orientation) == 0):
+        q = _quaternion(orientation)
+    T = np.eye(4)
+    T[:3, 3] = [x, y, z]
+    if q is not None:
+        T[:3, :3] = quaternion_matrix(q)
+    else:
+        c, s = np.cos(np.radians(w)), np.sin(np.radians(w))
+        T[:3, :3] = [[c, -s, 0], [s, c, 0], [0, 0, 1]]
+    return T, q is not None
 
 
 def parse_command(payload):
@@ -178,7 +256,8 @@ def parse_command(payload):
     """
     text = payload.decode("utf-8", errors="replace") if isinstance(payload, bytes) else str(payload)
     if text.strip().strip('"').lower() == "stop":
-        return {"state": "stop", "action": None, "product": "", "position": None, "request_id": None}
+        return {"state": "stop", "action": None, "product": "", "position": None, "orientation": None,
+                "symmetric": None, "request_id": None}
     try:
         msg = json.loads(text)
     except json.JSONDecodeError:
@@ -198,34 +277,41 @@ def parse_command(payload):
     product = msg.get("product") or ""
     if not isinstance(product, str):
         raise MessageError("product must be a string")
-    position = None if msg.get("position") in (None, "", []) else _position(msg["position"])
+    orientation = msg.get("orientation", msg.get("quaternion"))
+    orientation = None if orientation in (None, "", []) else _quaternion(orientation).tolist()
+    position = msg.get("position")
+    if position in (None, "", []) and msg.get("T_camera_object") is not None:
+        # FoundationPose's 4x4, as on the pose topic
+        T = parse_pose_message(json.dumps({"T_camera_object": msg["T_camera_object"]}))["T_camera_object"]
+        position, orientation = T[:3, 3].tolist(), matrix_quaternion(T[:3, :3]).tolist()
+    if position in (None, "", []):
+        position = None
+        if orientation is not None:
+            raise MessageError("an orientation needs a position too")
+    else:
+        x, y, z, w, q = _position(position)   # checked here, before anything moves
+        position = [float(x), float(y), float(z)] + ([w] if q is None and w else []) + ([] if q is None else q.tolist())
     if state == "start" and action == "place" and position is None:
         raise MessageError("place needs a position: where to put the object")
+    symmetric = msg.get("symmetric")
+    if symmetric is not None and not isinstance(symmetric, bool):
+        raise MessageError("symmetric must be true or false")
     _check_request_id(msg, text)   # optional, echoed in the status replies
     return {"state": state, "action": action, "product": product[:64], "position": position,
-            "request_id": msg["request_id"]}
+            "orientation": orientation, "symmetric": symmetric, "request_id": msg["request_id"]}
 
 
-def command_message(state, action=None, position=None, product=""):
-    """The command as the vision agent sends it (for mqtt_send.py and tests)."""
+def command_message(state, action=None, position=None, product="", orientation=None):
+    """The command as the vision agent sends it (for mqtt_send.py and tests).
+    orientation: [qx, qy, qz, qw] in the camera frame (FoundationPose's)."""
     msg = {"state": state, "product": product}
     if action is not None:
         msg["action"] = action
     if position is not None:
         msg["position"] = [round(float(v), 6) for v in position]
+    if orientation is not None:
+        msg["orientation"] = [round(float(v), 6) for v in orientation]
     return msg
-
-
-def camera_point_pose(position):
-    """[x, y, z, w] in the camera frame -> 4x4 T_camera_object: at x, y, z;
-    turned w degrees about the camera's view axis. For a top-down view
-    that's a turn about the vertical; a round object ignores it."""
-    x, y, z, w = (float(v) for v in position)
-    c, s = np.cos(np.radians(w)), np.sin(np.radians(w))
-    T = np.eye(4)
-    T[:3, :3] = [[c, -s, 0], [s, c, 0], [0, 0, 1]]
-    T[:3, 3] = [x, y, z]
-    return T
 
 
 # ============================================================

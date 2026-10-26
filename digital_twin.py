@@ -55,7 +55,7 @@ from manipulator_kinematics import (
     SERVO_LIMITS_DEG, T_FLANGE_CAMERA, T_FLANGE_TOOL, IKError, TableConstraint, fk, ik_solutions,
     joint_map, lowest_point, pose, rot_z,
 )
-from mqtt_link import COMMAND_TOPIC, STATUS_TOPIC, LocalBus, MessageError, _position, camera_point_pose, parse_command
+from mqtt_link import COMMAND_TOPIC, STATUS_TOPIC, LocalBus, MessageError, camera_pose, matrix_quaternion, parse_command
 from manipulator_agent import ManipulatorAgent, plan_place
 from pick_runner import Move, PickFailed, PickRunner, measured_flange, start_fake_vision
 
@@ -275,6 +275,15 @@ class TwinGripper:
 # THE TWIN
 # ============================================================
 
+def now_minus(obj, attr):
+    """Seconds since obj.<attr> was last stamped by this call (inf the first time); stamps it."""
+    now = time.monotonic()
+    last = getattr(obj, attr, -math.inf)
+    if now - last > 1.0:
+        setattr(obj, attr, now)
+    return now - last
+
+
 class Twin:
     def __init__(self, robot, feedback, gripper, link=None, table_z=0.0, home=None, max_speed=50,
                  place_xy=None, sim=False, object_diameter=0.06, log=print):
@@ -411,29 +420,33 @@ class Twin:
             self._publish_status("refused", {}, e)
             return
         what = " ".join(v for v in (cmd["state"], cmd["action"], cmd["product"]) if v)
-        where = "" if cmd["position"] is None else f" at {np.round(cmd['position'], 4).tolist()} (camera)"
-        self.log(f"MQTT command: {what}{where}")
+        where = "" if cmd["position"] is None else f" at {np.round(cmd['position'][:3], 4).tolist()} (camera)"
+        if cmd["state"] != "idle" or now_minus(self, "_idle_logged") > 1.0:   # a stream of idle poses: once a second
+            self.log(f"MQTT command: {what}{where}")
         if cmd["state"] == "stop":
             self.request_stop()
             self.cmd_stop()
             self._publish_status("stopped", cmd)
             return
-        position = None if cmd["position"] is None else cmd["position"].tolist()
+        position = cmd["position"]
 
         def run(c):
             r = self.handle(c, gen=gen, on_done=lambda state, detail: self._publish_status(state, cmd, detail))
             if not r["ok"]:
-                self.log(f"MQTT {what}: {r['error']}", "warn")
+                if cmd["state"] != "idle" or now_minus(self, "_idle_refused_logged") > 1.0:
+                    self.log(f"MQTT {what}: {r['error']}", "warn")
                 self._publish_status("refused", cmd, r["error"])
             return r
 
         if cmd["state"] == "idle" or (cmd["action"] == "pick" and position is not None):
             if position is not None:
-                r = run({"cmd": "set_object_camera", "position": position, "product": cmd["product"]})
+                r = run({"cmd": "set_object_camera", "position": position, "orientation": cmd["orientation"],
+                         "symmetric": cmd["symmetric"], "product": cmd["product"]})
                 if not r["ok"]:
                     return
                 if cmd["state"] == "idle":
-                    self._publish_status("updated", cmd, f"object at {r['xyz']} (base frame)")
+                    self._publish_status("updated", cmd, f"object at {r['xyz']} (base frame), "
+                                                         f"quaternion {r['quaternion']} (base frame)")
             elif cmd["state"] == "idle":
                 self._publish_status("idle", cmd)
             if cmd["state"] == "idle":
@@ -725,9 +738,10 @@ class Twin:
                 raise TwinError("the gripper is holding something: open it (or place it) first")
             T_base_object = self.object["T"].copy()
             d = self.object["diameter"]
+            symmetric = self.object.get("symmetric", True)
         T_camera_object = np.linalg.inv(fk(joint_map.servo_to_visual(q_now), "camera")) @ T_base_object
         return {"T_camera_object": T_camera_object, "origin": "center", "diameter": d,
-                "symmetric": True, "object": "twin", "request_id": None}
+                "symmetric": symmetric, "object": "twin", "request_id": None}
 
     def _plan_view(self, moves, q_start):
         """Moves -> what the browser draws: each waypoint and the tool tip path."""
@@ -967,13 +981,17 @@ class Twin:
             self.plan = None
         return {}
 
-    def cmd_set_object_camera(self, position, product="", diameter=None):
-        """The object at [x, y, z, w] in the wrist camera's frame (meters; w:
-        turn about the view axis, degrees), seen from where the arm is now:
-        what the vision agent measures, put into the twin to check it."""
-        p = _position(position)
+    def cmd_set_object_camera(self, position, orientation=None, product="", diameter=None, symmetric=None):
+        """The object's pose as the vision agent (FoundationPose) measures it,
+        in the wrist camera's frame seen from where the arm is now: position
+        [x, y, z] m (or [x, y, z, qx, qy, qz, qw], or [x, y, z, w] with w a
+        turn about the view axis in degrees) and orientation [qx, qy, qz, qw].
+        The twin's object takes that position and orientation. symmetric:
+        the grasp ignores the rotation (default: when none was given)."""
+        T_cam_obj, rotated = camera_pose(position, orientation)
         if not isinstance(product, str):
             raise TwinError("product must be a string")
+        symmetric = (not rotated) if symmetric is None else _bool(symmetric, "symmetric")
         d = self.object_diameter if diameter is None else _num(diameter, "diameter", 0.01, 0.2)
         with self.lock:
             if self.task is not None:
@@ -984,21 +1002,29 @@ class Twin:
         if state.get("mode") == 7:
             raise TwinError("the arm is moving: the camera's view moves with it")
         q = self._joints_now()
-        T = fk(joint_map.servo_to_visual(q), "camera") @ camera_point_pose(p)
+        T = fk(joint_map.servo_to_visual(q), "camera") @ T_cam_obj
         if max(abs(v) for v in T[:3, 3]) > 2.0:
             raise TwinError("the object is more than 2 m from the robot")
         with self.lock:
-            self.object = {"T": T, "diameter": d, "attached": False,
+            self.object = {"T": T, "diameter": d, "attached": False, "symmetric": symmetric,
                            "source": f"camera{': ' + product[:64] if product else ''}"}
             self.plan = None
         xyz = T[:3, 3]
-        reply = {"xyz": np.round(xyz, 4).tolist()}
-        detail = ""
+        tilt = math.degrees(math.acos(float(np.clip(T[2, 2], -1.0, 1.0))))   # object z axis from straight up
+        yaw = math.degrees(math.atan2(T[1, 0], T[0, 0]))
+        reply = {"xyz": np.round(xyz, 4).tolist(), "quaternion": np.round(matrix_quaternion(T[:3, :3]), 5).tolist(),
+                 "tilt_deg": round(tilt, 1), "yaw_deg": round(yaw, 1)}
+        detail = f", turned {yaw:.0f} deg, its z axis {tilt:.0f} deg from straight up" if rotated else ""
         if self.table_z is not None:
             above = float(xyz[2] - self.table_z)
             reply["above_table_mm"] = round(above * 1000, 1)
-            detail = f", centre {above * 1000:.0f} mm above the table (a {d * 1000:.0f} mm object on it: {d * 500:.0f})"
-        self.log(f"object from the camera {np.round(p[:3], 4).tolist()} m: base {np.round(xyz, 4).tolist()} m{detail}")
+            detail += f", centre {above * 1000:.0f} mm above the table (a {d * 1000:.0f} mm object on it: {d * 500:.0f})"
+        now = time.monotonic()
+        last_t, last_xyz = getattr(self, "_camera_logged", (-math.inf, None))
+        if now - last_t > 1.0 or last_xyz is None or np.linalg.norm(xyz - last_xyz) > 0.005:   # a live stream: not every frame
+            self._camera_logged = (now, xyz.copy())
+            self.log(f"object from the camera {np.round(T_cam_obj[:3, 3], 4).tolist()} m: "
+                     f"base {np.round(xyz, 4).tolist()} m{detail}")
         return reply
 
     def cmd_clear_object(self):
@@ -1078,7 +1104,7 @@ class Twin:
             raise TwinError("give position (camera frame) or xy (base frame)")
         q_now = self._joints_now()
         if position is not None:
-            xy = (fk(joint_map.servo_to_visual(q_now), "camera") @ camera_point_pose(_position(position)))[:2, 3].tolist()
+            xy = (fk(joint_map.servo_to_visual(q_now), "camera") @ camera_pose(position)[0])[:2, 3].tolist()
         xy = [float(v) for v in _vec(xy, 2, "xy")]
         if max(abs(v) for v in xy) > 2.0:
             raise TwinError("the place spot is more than 2 m from the robot")

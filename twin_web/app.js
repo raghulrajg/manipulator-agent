@@ -209,6 +209,10 @@ function buildObject(diameter) {
   stem.rotation.x = Math.PI / 2;
   stem.position.z = r * 0.95;
   g.add(fruit, stem);
+  const axes = new THREE.AxesHelper(r * 1.9);   // the object's own frame (x red, y green, z blue): shows its rotation
+  axes.material.depthTest = false;
+  axes.renderOrder = 2;
+  g.add(axes);
   g.userData.diameter = diameter;
   scene.add(g);
   world.objectMesh = g;
@@ -651,10 +655,17 @@ $('plan').addEventListener('click', () => act('plan'));
 $('pick').addEventListener('click', () => act('pick'));
 $('clear-plan').addEventListener('click', () => send('clear_plan'));
 $('detect').addEventListener('click', () => act('detect'));
-const cameraPosition = () => ['cam-x', 'cam-y', 'cam-z', 'cam-w'].map((id) => Number($(id).value));
+const cameraPosition = () => ['cam-x', 'cam-y', 'cam-z'].map((id) => Number($(id).value));
+const cameraOrientation = () => ['cam-qx', 'cam-qy', 'cam-qz', 'cam-qw'].map((id) => Number($(id).value));
 $('set-object-camera').addEventListener('click', async () => {
-  const r = await act('set_object_camera', { position: cameraPosition(), diameter: Number($('diameter').value) / 1000 });
-  if (r.ok && r.above_table_mm !== undefined) toast(`object at ${r.xyz.map((v) => (v * 1000).toFixed(1)).join(', ')} mm (base), centre ${r.above_table_mm} mm above the table`, 'info');
+  const r = await act('set_object_camera', {
+    position: cameraPosition(), orientation: cameraOrientation(), symmetric: $('cam-round').checked,
+    diameter: Number($('diameter').value) / 1000,
+  });
+  if (r.ok) {
+    const above = r.above_table_mm !== undefined ? `, centre ${r.above_table_mm} mm above the table` : '';
+    toast(`object at ${r.xyz.map((v) => (v * 1000).toFixed(1)).join(', ')} mm (base), turned ${r.yaw_deg}°, its z axis ${r.tilt_deg}° from straight up${above}`, 'info');
+  }
 });
 $('place-camera').addEventListener('click', () => act('place_at', { position: cameraPosition() }));
 
