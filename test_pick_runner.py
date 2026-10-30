@@ -29,6 +29,10 @@ import time
 
 import numpy as np
 
+import manipulator_kinematics as _mk
+
+_mk.set_camera_calibration(None)   # the tests check the camera table, not a saved calibration
+
 from dobot_tcp import DobotError, DobotTCP, error_text
 from fake_dobot import FakeDobot
 from gripper import FakeGripper, FeetechGripper

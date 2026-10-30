@@ -21,6 +21,7 @@ digital twin aiohttp (and a browser).
 | `gripper.py` | Feetech SMS/STS gripper through `scservo_sdk/` (your SDK, unchanged), with x-trainer's settings: left arm (robot 192.168.5.1) ID 21 on /dev/ttyUSB1, right arm (192.168.5.2) ID 22 on /dev/ttyUSB0, raw 3052 open … 2048 closed (x-trainer's file has it the other way round; on this gripper 2048 is closed, `--open-raw` / `--closed-raw` change it). `close()` tells whether the fingers stopped on something. |
 | `scservo_sdk/` | Feetech's SCServo Python SDK (SMS/STS and SCSCL servos, port handler), your copy unchanged. `gripper.py` uses it; it needs pyserial. |
 | `mqtt_link.py` | Shared by both sides: topics, the ready / pose / status messages, the vision agent's commands (start / stop / idle, pick / place, position + quaternion), quaternion conversions, the paho-mqtt client (EMQX: username, TLS, WebSocket), and `PoseGate` (ready → found → still 2.5 s → send once). |
+| `camera_calibration.py` | Fits the wrist camera's real mounting from camera / tool tip pairs and saves `camera_calibration.json`, which replaces the camera table everywhere. The twin records the pairs (Camera view → Camera calibration). |
 | `camera_stream.py` | The wrist camera (RealSense D405 by serial: colour + aligned depth) read in a thread for the twin's live Camera view; a fake test picture for `--sim`. Run alone to check the camera. |
 | `mqtt_send.py` | Send a command to the manipulator agent by hand, as the vision agent does, and print its replies. |
 | `foundationpose_mqtt.py` | Your FoundationPose tomato script with MQTT added: idle until "ready", then detect, track, wait until the pose has held 2.5 s, publish it once, idle again. Runs on the vision PC. |
@@ -229,6 +230,54 @@ view hides the panel.
 (`TWIN_STREAM_HZ`, default 5) and it sends every tracked pose to the twin
 as an `idle` command (below), so the twin's object follows the real one
 while the arm is still. Nothing moves the arm.
+
+### Camera calibration: where the camera really sits
+
+The camera position the twin and the pick use comes from the camera DH
+table (`camera_tranformation.py`). If the real camera is mounted
+differently, FoundationPose's numbers land the tomato in the wrong place.
+The height comes out right but x and y don't, and the error grows with the
+distance from the middle of the picture.
+
+**What four test pairs showed:** the camera is turned about 88° about its
+own view axis compared with the table, and its lens sits about 15 mm off.
+The errors were 41 to 252 mm with the camera table, and 5 to 9 mm with the
+fitted mounting when each pair was left out of the fit (that is, on a
+"new" tomato).
+
+**Calibrating in the twin:** open the Camera view, then the
+**Camera calibration** section under the tomato inputs.
+1. With the arm at the detection pose, type FoundationPose's numbers for a
+   real tomato, then press **1 Camera point**.
+2. Put the tool tip on that tomato's centre (Drag mode), then press
+   **2 Tool tip**.
+3. Repeat for 5 or more tomatoes spread over the picture, near the edges
+   too.
+4. Press **Solve**. It shows the turn, tilt and shift against the table,
+   each pair's error, and each pair's error when it is left out of the
+   fit.
+5. Press **Apply**. This writes `camera_calibration.json`, and from then
+   on the twin and `pick_runner.py` use it instead of the camera table.
+   **Remove** goes back to the table.
+
+**From numbers you wrote down:**
+
+```
+python3 camera_calibration.py calibration/pairs_4_tests.json          # the four tests: solve and show
+python3 camera_calibration.py calibration/pairs_4_tests.json --save   # ... and use it
+python3 camera_calibration.py --show                                  # what is in use
+python3 camera_calibration.py --remove                                # back to the camera table
+```
+
+Each pair is FoundationPose's `camera` position (m) plus the `tip_mm`,
+and the arm's `joints` at the detection pose. If you don't have the
+joints, the twin's `object_base_mm` for the same camera numbers will do,
+as long as all those pairs come from the same arm pose. A pair that
+disagrees with the others is pointed out.
+
+`camera_calibration.json` is per robot and camera mount: calibrate again
+after the camera is moved. The tests always run against the camera
+table.
 
 ### MQTT commands from the vision agent (EMQX)
 

@@ -1,0 +1,7 @@
+{"note": "The four tests from 2026-10-30: FoundationPose (camera frame, m), the twin's object (base, mm, placed with the camera table), the tool tip put on the real tomato (base, mm, FK).",
+ "pairs": [
+  {"camera": [-0.168, -0.012, 0.337], "object_base_mm": [-225, 105.5, 41.4], "tip_mm": [-391.2, -62.8, 38.3]},
+  {"camera": [-0.030, -0.127, 0.270], "object_base_mm": [-393, -9.5, 108.4], "tip_mm": [-508.9, 69.2, 95.0]},
+  {"camera": [0.153, -0.096, 0.277], "object_base_mm": [-576, 21.5, 101.4], "tip_mm": [-487.0, 257.4, 93.2]},
+  {"camera": [0.016, -0.007, 0.288], "object_base_mm": [-439, 110.5, 90.4], "tip_mm": [-399.6, 123.1, 89.1]}
+ ]}

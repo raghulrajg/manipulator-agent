@@ -46,7 +46,9 @@ joint state first.
 """
 
 import itertools
+import json
 import math
+import os
 from dataclasses import dataclass
 from typing import List, Optional, Tuple
 
@@ -193,8 +195,56 @@ def _flange_to(table):
 
 
 T_FLANGE_TOOL = _flange_to("tool")
-T_FLANGE_CAMERA = _flange_to("camera")
+T_FLANGE_CAMERA_DH = _flange_to("camera")      # the camera table, as given
+T_FLANGE_CAMERA = T_FLANGE_CAMERA_DH.copy()     # what is used: the table, or the calibration below
 _FLANGE_TO = {"flange": np.eye(4), "tool": T_FLANGE_TOOL, "camera": T_FLANGE_CAMERA}
+
+# ----------------------------------------------------------------------
+# Camera calibration: the camera's real mounting, measured on the robot
+# (camera_calibration.py), replaces the camera table when
+# camera_calibration.json exists next to this file (or at the path in
+# $CAMERA_CALIBRATION). Everything that uses fk(q, "camera") or
+# T_FLANGE_CAMERA picks it up.
+# ----------------------------------------------------------------------
+CAMERA_CALIBRATION_FILE = os.environ.get(
+    "CAMERA_CALIBRATION", os.path.join(os.path.dirname(os.path.abspath(__file__)), "camera_calibration.json"))
+camera_calibration = None   # the calibration in use (the file's contents); None = the camera table
+
+
+def set_camera_calibration(T_flange_camera, info=None):
+    """Use T_flange_camera (4x4, m) for the camera from now on; None goes
+    back to the camera table. Updated in place, so every module sees it."""
+    global camera_calibration
+    if T_flange_camera is None:
+        T_FLANGE_CAMERA[:] = T_FLANGE_CAMERA_DH
+        camera_calibration = None
+        return
+    T = np.asarray(T_flange_camera, dtype=float)
+    R = T[:3, :3] if T.shape == (4, 4) else None
+    if R is None or not np.all(np.isfinite(T)) or not np.allclose(T[3], [0, 0, 0, 1]) or \
+            not np.allclose(R.T @ R, np.eye(3), atol=1e-4) or np.linalg.det(R) < 0:
+        raise ValueError("a camera calibration must be a 4x4 rigid transform")
+    if np.linalg.norm(T[:3, 3]) > 0.5:
+        raise ValueError("a camera calibration more than 0.5 m from the flange: check its units (m)")
+    T_FLANGE_CAMERA[:] = T
+    camera_calibration = dict(info or {}, T_flange_camera=T.round(8).tolist())
+
+
+def load_camera_calibration(path=None):
+    """Load camera_calibration.json if it exists; returns whether it did."""
+    path = path or CAMERA_CALIBRATION_FILE
+    if not os.path.exists(path):
+        return False
+    with open(path) as f:
+        data = json.load(f)
+    set_camera_calibration(data["T_flange_camera"], dict(data, file=os.path.abspath(path)))
+    return True
+
+
+try:
+    load_camera_calibration()
+except (OSError, ValueError, KeyError) as _e:
+    print(f"warning: {CAMERA_CALIBRATION_FILE} not used ({_e}); the camera table is used instead")
 
 
 def fk(q, frame="tool"):

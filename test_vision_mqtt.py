@@ -25,6 +25,10 @@ import types
 
 import numpy as np
 
+import manipulator_kinematics as _mk
+
+_mk.set_camera_calibration(None)   # the tests check the camera table, not a saved calibration
+
 from mqtt_link import POSE_TOPIC, READY_TOPIC, LocalBus, ready_message
 
 FRAME_DT = 0.1                                 # fake camera: 10 fps

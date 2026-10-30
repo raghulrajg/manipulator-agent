@@ -40,6 +40,10 @@ import sys
 
 import numpy as np
 
+import manipulator_kinematics as _mk
+
+_mk.set_camera_calibration(None)   # the tests check the camera table, not a saved calibration
+
 from manipulator_kinematics import (
     ARM_DH, IKError, SERVO_LIMITS_DEG, WRIST_DH, build_dh_params, fk,
     forward_kinematics_6dof, ik_solutions, joint_map,

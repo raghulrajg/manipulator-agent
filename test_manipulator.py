@@ -12,6 +12,10 @@ import math
 
 import numpy as np
 
+import manipulator_kinematics as _mk
+
+_mk.set_camera_calibration(None)   # the tests check the camera table, not a saved calibration
+
 from manipulator_agent import ManipulatorAgent, as_pose, pose_from_rvec_tvec
 from manipulator_kinematics import (
     IKError, SERVO_LIMITS_DEG, T_FLANGE_TOOL, TableConstraint, build_dh_params, fk,

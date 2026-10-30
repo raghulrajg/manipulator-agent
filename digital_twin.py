@@ -35,6 +35,7 @@ import argparse
 import asyncio
 import json
 import math
+import os
 import queue
 import secrets
 import threading
@@ -56,6 +57,7 @@ from manipulator_kinematics import (
     joint_map, lowest_point, pose, rot_z,
 )
 from mqtt_link import COMMAND_TOPIC, STATUS_TOPIC, LocalBus, MessageError, camera_pose, matrix_quaternion, parse_command
+import manipulator_kinematics as mk
 from manipulator_agent import ManipulatorAgent, plan_place
 from pick_runner import Move, PickFailed, PickRunner, measured_flange, start_fake_vision
 
@@ -327,6 +329,9 @@ class Twin:
         self.runner.on_status = lambda state, detail: self._set_step(f"{state}" + (f": {detail}" if detail else ""))
         self.fake = None            # the simulated controller, with --sim
         self.camera = None          # the live wrist camera (camera_stream.py), with --camera
+        self.model = None           # what the browser draws (load_model), set by the web app
+        self._camera_seen = None    # the last FoundationPose numbers typed in, and the joints then
+        self.calib = {"pending": None, "pairs": []}   # camera calibration pairs being recorded
         self.clients_heard = None   # set by the web server: seconds since any browser spoke
         self._tasks = queue.Queue()
         threading.Thread(target=self._worker, daemon=True, name="twin-tasks").start()
@@ -386,6 +391,8 @@ class Twin:
                 "ghost": None if self.ghost is None else np.round(self.ghost, 4).tolist(),
                 "plan": self.plan, "model_error_mm": self.model_error_mm, "sim": self.sim,
                 "can_detect": self.can_detect, "log_seq": self._log_seq,
+                "calib": {"pairs": len(self.calib["pairs"]), "pending": self.calib["pending"] is not None,
+                          "active": mk.camera_calibration is not None},
             }
 
     # ------------------------------------------------------------ MQTT commands
@@ -1010,6 +1017,7 @@ class Twin:
             self.object = {"T": T, "diameter": d, "attached": False, "symmetric": symmetric,
                            "source": f"camera{': ' + product[:64] if product else ''}"}
             self.plan = None
+            self._camera_seen = {"camera": T_cam_obj[:3, 3].round(5).tolist(), "joints": np.round(q, 4).tolist()}
         xyz = T[:3, 3]
         tilt = math.degrees(math.acos(float(np.clip(T[2, 2], -1.0, 1.0))))   # object z axis from straight up
         yaw = math.degrees(math.atan2(T[1, 0], T[0, 0]))
@@ -1027,6 +1035,95 @@ class Twin:
             self.log(f"object from the camera {np.round(T_cam_obj[:3, 3], 4).tolist()} m: "
                      f"base {np.round(xyz, 4).tolist()} m{detail}")
         return reply
+
+    # camera calibration: FoundationPose's numbers for a real object, then the tool tip put on it
+    def cmd_calib_point(self):
+        """Pair step 1: the FoundationPose numbers typed in last, and where the arm was."""
+        with self.lock:
+            if self._camera_seen is None:
+                raise TwinError("first type FoundationPose's numbers for a real tomato (the tomato moves)")
+            self.calib["pending"] = dict(self._camera_seen)
+        return self._calib_state("camera point recorded: now put the tool tip on that tomato's centre "
+                                 "(drag mode) and record the tool tip")
+
+    def cmd_calib_tip(self):
+        """Pair step 2: the tool tip, put on the real object's centre."""
+        q = self._joints_now()
+        tip = fk(joint_map.servo_to_visual(q), "tool")[:3, 3]
+        with self.lock:
+            if self.calib["pending"] is None:
+                raise TwinError("record the camera point first")
+            pending = self.calib["pending"]
+            if np.abs(q - np.array(pending["joints"])).max() < 0.5:
+                raise TwinError("the arm has not moved since the camera point: put the tool tip on the tomato first")
+            self.calib["pairs"].append({**pending, "tip_mm": np.round(tip * 1000, 2).tolist(),
+                                        "tip_joints": np.round(q, 4).tolist()})
+            self.calib["pending"] = None
+        self.log(f"calibration pair {len(self.calib['pairs'])}: camera {pending['camera']} m, "
+                 f"tool tip {np.round(tip * 1000, 1).tolist()} mm")
+        return self._calib_state("pair recorded")
+
+    def cmd_calib_undo(self):
+        with self.lock:
+            if self.calib["pending"] is not None:
+                self.calib["pending"] = None
+            elif self.calib["pairs"]:
+                self.calib["pairs"].pop()
+        return self._calib_state("undone")
+
+    def cmd_calib_clear(self):
+        with self.lock:
+            self.calib = {"pending": None, "pairs": []}
+        return self._calib_state("cleared")
+
+    def _calib_state(self, text):
+        with self.lock:
+            return {"text": text, "pairs": len(self.calib["pairs"]), "pending": self.calib["pending"] is not None}
+
+    def cmd_calib_solve(self):
+        from camera_calibration import CalibrationError, describe, solve
+        with self.lock:
+            pairs = [dict(p) for p in self.calib["pairs"]]
+        try:
+            result = solve(pairs)
+        except CalibrationError as e:
+            raise TwinError(f"calibration: {e}") from None
+        return {"result": result, "text": describe(result)}
+
+    def cmd_calib_apply(self):
+        """Save the solved calibration (camera_calibration.json) and use it now."""
+        from camera_calibration import CalibrationError, save, solve
+        with self.lock:
+            if self.task is not None:
+                raise TwinError(f"busy: {self.task}")
+            pairs = [dict(p) for p in self.calib["pairs"]]
+        try:
+            result = solve(pairs)
+        except CalibrationError as e:
+            raise TwinError(f"calibration: {e}") from None
+        path = save(result, pairs)
+        self._camera_changed()
+        self.log(f"camera calibration saved ({path}) and in use: turned {result['turn_deg']} deg, "
+                 f"left-out errors {result['left_out_mm']} mm", "warn")
+        return {"reload": True}
+
+    def cmd_calib_remove(self):
+        """Back to the camera table (deletes camera_calibration.json)."""
+        with self.lock:
+            if self.task is not None:
+                raise TwinError(f"busy: {self.task}")
+        if os.path.exists(mk.CAMERA_CALIBRATION_FILE):
+            os.remove(mk.CAMERA_CALIBRATION_FILE)
+        mk.set_camera_calibration(None)
+        self._camera_changed()
+        self.log("camera calibration removed: the camera table is used", "warn")
+        return {"reload": True}
+
+    def _camera_changed(self):
+        with self.lock:
+            self.plan = None
+            if self.model is not None:
+                self.model["link6_camera"] = (T_LINK6_FLANGE @ mk.T_FLANGE_CAMERA).round(8).tolist()
 
     def cmd_clear_object(self):
         with self.lock:
@@ -1168,6 +1265,7 @@ def make_app(twin, model, config, token, camera=None, camera_fps=15):
     and Overlay modes."""
     from aiohttp import WSMsgType, web
 
+    twin.model = model                                  # a camera calibration updates what the page draws
     clients = {}                                        # ws -> {"seq": last log sent, "heard": monotonic}
     last_heard = [-math.inf]                            # any browser, monotonic (one float: no dict walk off-loop)
     instance = secrets.token_hex(4)                     # a restarted server starts its log afresh

@@ -50,6 +50,26 @@
           <label>yaw ° <input type="number" id="cam-yaw" value="0" step="5"></label>
         </div>
         <div id="cam-status" class="small muted">Type the values: the tomato moves.</div>
+        <details id="calib">
+          <summary class="small">Camera calibration <span id="calib-state" class="muted"></span></summary>
+          <ol class="small muted calib-steps">
+            <li>Arm at the detection pose: type FoundationPose's numbers for a real tomato, then <b>1</b>.</li>
+            <li>Put the tool tip on that tomato's centre (Drag mode), then <b>2</b>.</li>
+            <li>Back to the detection pose; repeat for 5 or more tomatoes spread over the picture; <b>Solve</b>, then <b>Apply</b>.</li>
+          </ol>
+          <div class="buttons">
+            <button id="calib-point" title="The numbers typed above, with where the arm is">1 Camera point</button>
+            <button id="calib-tip" title="Where the tool tip is now">2 Tool tip</button>
+            <button id="calib-undo">Undo</button>
+            <button id="calib-clear">Clear</button>
+          </div>
+          <div class="buttons">
+            <button id="calib-solve">Solve</button>
+            <button id="calib-apply" class="primary" title="Save camera_calibration.json and use it">Apply</button>
+            <button id="calib-remove" title="Back to the camera table">Remove</button>
+          </div>
+          <pre id="calib-result" class="small" hidden></pre>
+        </details>
       </div>
     </div>
 

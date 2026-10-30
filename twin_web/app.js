@@ -426,6 +426,9 @@ function setBadge(el, text, cls) {
 }
 
 function onState(s) {
+  if (s.calib) {
+    $('calib-state').textContent = `· ${s.calib.active ? 'calibrated' : 'camera table'} · ${s.calib.pairs} pair${s.calib.pairs === 1 ? '' : 's'}${s.calib.pending ? ' + 1 waiting for the tool tip' : ''}`;
+  }
   state = s;
   lastStateAt = performance.now();
   if (!sceneReady) return;
@@ -669,6 +672,23 @@ async function tomatoFromCamera() {
   status.textContent = `tomato at ${r.xyz.map((x) => (x * 1000).toFixed(1)).join(', ')} mm (base)${above}`;
 }
 CAM_FIELDS.forEach((id) => $(id).addEventListener('input', () => throttle('cam', 100, tomatoFromCamera)));
+
+// camera calibration: pairs of (FoundationPose's numbers, the tool tip on that tomato)
+function calibShow(text) { const el = $('calib-result'); el.textContent = text; el.hidden = !text; }
+async function calibCall(cmd) {
+  const r = await act(cmd);
+  if (r.ok) {
+    if (r.reload) { location.reload(); return; }
+    calibShow(r.text || '');
+  }
+}
+['point', 'tip', 'undo', 'clear', 'solve'].forEach((k) => $(`calib-${k}`).addEventListener('click', () => calibCall(`calib_${k}`)));
+$('calib-apply').addEventListener('click', () => {
+  if (confirm('Save this camera calibration and use it for the twin and the pick?')) calibCall('calib_apply');
+});
+$('calib-remove').addEventListener('click', () => {
+  if (confirm('Remove the camera calibration and go back to the camera table?')) calibCall('calib_remove');
+});
 
 const raycaster = new THREE.Raycaster();
 let downAt = null;

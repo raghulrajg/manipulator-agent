@@ -34,6 +34,10 @@ import time
 
 import numpy as np
 
+import manipulator_kinematics as _mk
+
+_mk.set_camera_calibration(None)   # the tests check the camera table, not a saved calibration
+
 from digital_twin import WEB, Twin, demo_pose_on_table, load_model, make_app, model_fk, T_LINK6_FLANGE
 from dobot_feedback import FIELDS, PACKET_SIZE, FeedbackError, FeedbackReader, pack_feedback, parse_feedback
 from dobot_tcp import DobotError, DobotTCP
@@ -846,6 +850,83 @@ def test_table_height_checks():
 # WEBSOCKET AND BROWSER
 # ============================================================
 
+def test_camera_calibration():
+    print("=" * 60)
+    print("Camera calibration: a camera turned 88 deg on its mount, found from camera / tool tip pairs")
+    print("=" * 60)
+    import manipulator_kinematics as mk
+    from camera_calibration import CalibrationError, solve
+    from manipulator_kinematics import pose, rot_x, rot_z
+    # the "real" camera: the table's, turned 88 deg about the view axis, tilted 4 deg, shifted
+    C = pose(rot_z(math.radians(88)) @ rot_x(math.radians(4)), [-0.012, -0.015, 0.002])
+    T_true = mk.T_FLANGE_CAMERA_DH @ C
+    objects = [[-0.39, -0.06, 0.04], [-0.51, 0.07, 0.095], [-0.49, 0.26, 0.09], [-0.40, 0.12, 0.09], [-0.30, 0.20, 0.05]]
+    home = joint_map.home_servo_deg
+    T_bf = fk(joint_map.servo_to_visual(home), "flange")
+
+    def seen(obj, T_base_flange=T_bf):   # what FoundationPose reports for an object at obj (base frame)
+        return (np.linalg.inv(T_base_flange @ T_true) @ np.array([*obj, 1.0]))[:3].round(5).tolist()
+
+    # by hand: joints known, or the twin's object_base (placed with the camera table)
+    by_joints = [{"camera": seen(o), "joints": home.tolist(), "tip_mm": (np.array(o) * 1000).tolist()} for o in objects]
+    r = solve(by_joints)
+    assert np.allclose(r["T_flange_camera"], T_true, atol=2e-4) and max(r["residual_mm"]) < 0.05, r
+    assert abs(r["turn_deg"] - 88) < 0.5 and max(r["camera_table_error_mm"]) > 30, r
+    T_bc_table = T_bf @ mk.T_FLANGE_CAMERA_DH
+    by_object = [{"camera": p["camera"], "tip_mm": p["tip_mm"],
+                  "object_base_mm": ((T_bc_table @ np.array([*p["camera"], 1.0]))[:3] * 1000).tolist()} for p in by_joints]
+    by_object[0]["object_base_mm"][0] += 30   # one typing slip: found, and not used for the camera pose
+    r = solve(by_object)
+    assert np.allclose(r["T_flange_camera"], T_true, atol=1e-4) and any("pair 1" in n for n in r["notes"]), r
+    for bad, why in ((by_joints[:2], "at least 3"),
+                     ([dict(p, camera=[0.0, 0.0, 0.3 + 0.01 * i]) for i, p in enumerate(by_joints)], "in a line"),
+                     ([dict(by_joints[0], joints=None)] + by_joints[1:], "joints or object_base")):
+        try:
+            solve(bad)
+            raise AssertionError(f"accepted: {why}")
+        except CalibrationError as e:
+            assert why in str(e), e
+
+    # in the twin: type the numbers, record; put the tool tip on it, record; ... solve, apply
+    h = Harness()
+    saved_file = mk.CAMERA_CALIBRATION_FILE
+    mk.CAMERA_CALIBRATION_FILE = os.path.join(tempfile.mkdtemp(), "camera_calibration.json")
+    try:
+        h.ok("arm")
+        h.ok("speed", value=100)
+        h.refused("calib_tip", "camera point first")
+        for obj in objects:
+            h.ok("home")
+            h.idle(60)
+            h.ok("set_object_camera", position=seen(obj))
+            h.ok("calib_point")
+            h.refused("calib_tip", "has not moved")
+            T = fk(joint_map.servo_to_visual(home), "tool")
+            T[:3, 3] = obj
+            h.ok("move_pose", T=T.tolist())
+            h.idle(60)
+            h.ok("calib_tip")
+        assert h.twin.snapshot()["calib"] == {"pairs": 5, "pending": False, "active": False}
+        r = h.ok("calib_solve")["result"]
+        assert np.allclose(r["T_flange_camera"], T_true, atol=1e-4) and max(r["residual_mm"]) < 0.5, r
+        assert h.ok("calib_apply")["reload"] and os.path.exists(mk.CAMERA_CALIBRATION_FILE)
+        assert h.twin.snapshot()["calib"]["active"] and np.allclose(mk.T_FLANGE_CAMERA, T_true, atol=1e-4)
+        # now the camera's numbers put the tomato where it really is
+        h.ok("home")
+        h.idle(60)
+        xyz = h.ok("set_object_camera", position=seen(objects[2]))["xyz"]
+        assert np.allclose(xyz, objects[2], atol=1e-3), xyz
+        h.ok("calib_remove")
+        assert mk.camera_calibration is None and np.allclose(mk.T_FLANGE_CAMERA, mk.T_FLANGE_CAMERA_DH)
+        assert not os.path.exists(mk.CAMERA_CALIBRATION_FILE)
+    finally:
+        mk.set_camera_calibration(None)
+        mk.CAMERA_CALIBRATION_FILE = saved_file
+        h.close()
+    print("OK: an 88 deg camera turn found from 5 pairs (by joints, by the twin's numbers, recorded in the "
+          "twin); after Apply the camera's numbers land on the real object\n")
+
+
 def test_live_camera():
     print("=" * 60)
     print("Live camera: /camera/info and the MJPEG stream (simulated camera)")
@@ -1082,6 +1163,7 @@ if __name__ == "__main__":
     test_table_height_checks()
     test_object_from_camera()
     test_mqtt_commands()
+    test_camera_calibration()
     test_live_camera()
     test_websocket()
     test_browser()
