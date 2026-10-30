@@ -21,6 +21,7 @@ digital twin aiohttp (and a browser).
 | `gripper.py` | Feetech SMS/STS gripper through `scservo_sdk/` (your SDK, unchanged), with x-trainer's settings: left arm (robot 192.168.5.1) ID 21 on /dev/ttyUSB1, right arm (192.168.5.2) ID 22 on /dev/ttyUSB0, raw 3052 open … 2048 closed (x-trainer's file has it the other way round; on this gripper 2048 is closed, `--open-raw` / `--closed-raw` change it). `close()` tells whether the fingers stopped on something. |
 | `scservo_sdk/` | Feetech's SCServo Python SDK (SMS/STS and SCSCL servos, port handler), your copy unchanged. `gripper.py` uses it; it needs pyserial. |
 | `mqtt_link.py` | Shared by both sides: topics, the ready / pose / status messages, the vision agent's commands (start / stop / idle, pick / place, position + quaternion), quaternion conversions, the paho-mqtt client (EMQX: username, TLS, WebSocket), and `PoseGate` (ready → found → still 2.5 s → send once). |
+| `camera_stream.py` | The wrist camera (RealSense D405 by serial: colour + aligned depth) read in a thread for the twin's live Camera view; a fake test picture for `--sim`. Run alone to check the camera. |
 | `mqtt_send.py` | Send a command to the manipulator agent by hand, as the vision agent does, and print its replies. |
 | `foundationpose_mqtt.py` | Your FoundationPose tomato script with MQTT added: idle until "ready", then detect, track, wait until the pose has held 2.5 s, publish it once, idle again. Runs on the vision PC. |
 | `digital_twin.py` + `twin_web/` | **Digital twin**: a browser app with Dobot's own Nova 2 model that moves exactly as the robot does (real-time feedback) and moves the robot from the browser (checked MovJ / MovL, gripper, pick and place). `--sim` runs it on the fake controller. See "Digital twin" below. |
@@ -168,7 +169,41 @@ included, can move the robot.
   really is at it. A pick that misses goes back up and home, as on the
   robot.
 
-### Testing the vision agent: the tomato from FoundationPose's numbers
+### Live wrist camera in the Camera view
+
+Start the twin with `--camera` to see the real wrist camera (the
+RealSense D405, serial 419122270335) in the **Camera** view:
+
+```
+python3 digital_twin.py --robot 192.168.5.1 --table-z 0.018 --camera          # the D405
+python3 digital_twin.py --robot 192.168.5.1 --table-z 0.018 --camera 1234567  # another RealSense by serial
+python3 digital_twin.py --sim --camera fake                                    # a test picture, no camera
+python3 camera_stream.py --serial 419122270335                                 # check the camera alone
+```
+
+Press **Camera**; buttons under it choose what the view shows:
+
+| Mode | What you see |
+|---|---|
+| **Simulation** | The twin seen from the wrist camera (works without `--camera`). |
+| **Live** | The camera's live picture: **Colour**, or **Depth** (aligned to colour, JET colours, as in your test script). |
+| **Overlay** | The twin's robot and tomato drawn over the live picture, the table left out. With the right kinematics, camera offset and FoundationPose numbers, the twin's tomato sits on the real one. |
+
+- **Projection:** the Camera view uses the real camera's intrinsics (fx, fy
+  and principal point from the D405), so the twin and the picture line up
+  pixel for pixel, at any window size.
+- **Frame rate:** the picture streams to the browser as MJPEG at up to
+  `--camera-fps` (default 15) frames per second. Every frame is encoded
+  once, however many pages watch. The stream needs the page's access
+  token, like the rest of the app.
+- **One program per camera:** only one program can open a RealSense at a
+  time. If the FoundationPose script (or its camera router) has the D405,
+  the page says the camera cannot be opened. The twin retries every 2 s,
+  so it picks the camera up once that program stops.
+- **Setup:** `pip install pyrealsense2 opencv-python` on the PC the camera
+  is plugged into.
+
+
 
 Press **Camera** (top right of the 3D view) to look through the wrist
 camera. A panel, **Tomato from FoundationPose**, appears at the bottom

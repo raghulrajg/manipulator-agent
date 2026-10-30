@@ -846,6 +846,57 @@ def test_table_height_checks():
 # WEBSOCKET AND BROWSER
 # ============================================================
 
+def test_live_camera():
+    print("=" * 60)
+    print("Live camera: /camera/info and the MJPEG stream (simulated camera)")
+    print("=" * 60)
+    from aiohttp.test_utils import TestClient, TestServer
+    from camera_stream import FakeCamera
+    try:
+        import cv2  # noqa: F401  (the camera's JPEGs)
+    except ImportError:
+        print("skipped: needs opencv-python\n")
+        return
+    h = Harness()
+    cam = FakeCamera(fps=30).start()
+
+    async def run():
+        # without --camera: the page is told there is none
+        async with TestClient(TestServer(make_app(h.twin, load_model(), CONFIG, TOKEN))) as client:
+            info = await (await client.get(f"/camera/info?token={TOKEN}")).json()
+            assert info["available"] is False and "--camera" in info["error"], info
+            assert (await client.get(f"/camera.mjpg?token={TOKEN}")).status == 404
+        async with TestClient(TestServer(make_app(h.twin, load_model(), CONFIG, TOKEN, camera=cam,
+                                                  camera_fps=30))) as client:
+            for path in ("/camera/info", "/camera.mjpg", f"/camera.mjpg?token=wrong-token"):
+                assert (await client.get(path)).status == 403, path
+            r = await client.get(f"/camera.mjpg?token={TOKEN}", headers={"Origin": "http://evil.example"})
+            assert r.status == 403
+            assert (await client.get(f"/camera.mjpg?token={TOKEN}&kind=infrared")).status == 400
+            wait_for(lambda: cam.info()["live"], 5, "the camera's first frame")
+            info = await (await client.get(f"/camera/info?token={TOKEN}")).json()
+            assert info["available"] and info["live"] and info["intrinsics"]["fx"] > 0, info
+            for kind in ("color", "depth"):
+                r = await client.get(f"/camera.mjpg?token={TOKEN}&kind={kind}")
+                assert r.status == 200 and r.headers["Content-Type"].startswith("multipart/x-mixed-replace")
+                data, t0 = b"", time.monotonic()
+                while data.count(b"\xff\xd9") < 3 and time.monotonic() - t0 < 5:   # three whole JPEGs
+                    data += await r.content.readany()
+                r.close()
+                assert data.startswith(b"--frame\r\nContent-Type: image/jpeg") and data.count(b"\xff\xd8") >= 3, data[:80]
+                import cv2
+                start = data.index(b"\xff\xd8")
+                img = cv2.imdecode(np.frombuffer(data[start:data.index(b"\xff\xd9", start) + 2], np.uint8), 1)
+                assert img.shape == (480, 640, 3), img.shape
+
+    try:
+        asyncio.run(run())
+    finally:
+        cam.stop()
+        h.close()
+    print("OK: the stream needs the token, plays colour and depth JPEGs; none without --camera\n")
+
+
 def test_websocket():
     print("=" * 60)
     print("WebSocket: hello, 30 Hz state, commands, deadman stop")
@@ -1031,5 +1082,6 @@ if __name__ == "__main__":
     test_table_height_checks()
     test_object_from_camera()
     test_mqtt_commands()
+    test_live_camera()
     test_websocket()
     test_browser()

@@ -23,6 +23,7 @@
 
   <main>
     <div id="view">
+      <img id="live-img" hidden alt="the wrist camera's live picture">
       <div id="hud">
         <div id="task" class="muted">idle</div>
         <div id="pick-hint" hidden></div>
@@ -32,6 +33,13 @@
         <button data-view="top" title="From above">Top</button>
         <button data-view="front" title="From the front">Front</button>
         <button id="follow-cam" title="Watch through the wrist camera">Camera</button>
+      </div>
+      <div id="cam-source" hidden>
+        <button data-cam="sim" class="active" title="The twin, seen from the wrist camera">Simulation</button>
+        <button data-cam="live" title="The wrist camera's live picture">Live</button>
+        <button data-cam="overlay" title="The twin drawn over the live picture: they should line up">Overlay</button>
+        <select id="cam-kind" hidden title="Live picture"><option value="color">Colour</option><option value="depth">Depth</option></select>
+        <div id="cam-note" class="small" hidden></div>
       </div>
       <div id="cam-panel" hidden title="Type the tomato's pose from FoundationPose: relative to the wrist camera (x right, y down, z along the view), at the arm's current pose. The tomato moves as you type.">
         <div class="cam-title">Tomato from FoundationPose <span class="muted">(camera frame)</span></div>

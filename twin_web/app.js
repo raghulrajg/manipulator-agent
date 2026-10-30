@@ -32,7 +32,7 @@ const targets = new Array(6).fill(0);
 // ============================================================
 
 const view = $('view');
-const renderer = new THREE.WebGLRenderer({ antialias: true, preserveDrawingBuffer: true });
+const renderer = new THREE.WebGLRenderer({ antialias: true, preserveDrawingBuffer: true, alpha: true });   // alpha: the twin over the live picture
 renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
 renderer.shadowMap.enabled = true;
 view.appendChild(renderer.domElement);
@@ -40,7 +40,7 @@ view.appendChild(renderer.domElement);
 const scene = new THREE.Scene();
 const themeBackground = () => new THREE.Color(getComputedStyle(document.documentElement).getPropertyValue('--bg').trim() || '#0f141b');
 scene.background = themeBackground();
-matchMedia('(prefers-color-scheme: light)').addEventListener('change', () => { scene.background = themeBackground(); });
+matchMedia('(prefers-color-scheme: light)').addEventListener('change', () => { if (scene.background) scene.background = themeBackground(); });
 const camera = new THREE.PerspectiveCamera(45, 1, 0.01, 20);
 camera.up.set(0, 0, 1);
 camera.position.set(-1.1, -1.0, 0.85);
@@ -107,6 +107,7 @@ function buildTable(tableZ) {
   }
   scene.add(group);
   world.table = top;
+  world.tableGroup = group;
 }
 
 function buildRobot(isGhost) {
@@ -696,6 +697,7 @@ document.querySelectorAll('[data-view]').forEach((b) => b.addEventListener('clic
   followCamera = false;
   $('cam-panel').hidden = true;
   $('follow-cam').classList.remove('active');
+  applyCameraMode();
   orbit.enabled = true;
   const v = VIEWS[b.dataset.view];
   camera.position.set(...v.pos);
@@ -708,11 +710,83 @@ $('follow-cam').addEventListener('click', () => {
   followCamera = !followCamera;
   $('cam-panel').hidden = !followCamera;
   $('follow-cam').classList.toggle('active', followCamera);
+  applyCameraMode();
   orbit.enabled = !followCamera;
   camera.fov = followCamera ? 42 : 45;   // RealSense colour stream, vertical
   camera.updateProjectionMatrix();
   if (!followCamera) { camera.position.set(...VIEWS.iso.pos); orbit.target.set(...VIEWS.iso.at); orbit.update(); }
 });
+
+// ------------------------------------------------------------ the live wrist camera
+// Camera view: Simulation (the twin), Live (the D405's picture, digital_twin.py
+// --camera) or Overlay (the twin drawn over the live picture, the table left out).
+let camMode = 'sim';
+let camInfo = null;                       // /camera/info: available, live, error, intrinsics
+const liveImg = $('live-img');
+function liveUrl() { return `/camera.mjpg?token=${encodeURIComponent(TOKEN)}&kind=${$('cam-kind').value}`; }
+function applyCameraMode() {
+  const live = followCamera && camMode !== 'sim';
+  $('cam-source').hidden = !followCamera;
+  document.querySelectorAll('[data-cam]').forEach((b) => b.classList.toggle('active', b.dataset.cam === camMode));
+  $('cam-kind').hidden = camMode === 'sim';
+  if (live) {
+    if (liveImg.dataset.url !== liveUrl()) { liveImg.dataset.url = liveUrl(); liveImg.src = liveUrl(); }
+  } else if (liveImg.dataset.url) {
+    delete liveImg.dataset.url;
+    liveImg.removeAttribute('src');          // closes the stream
+  }
+  liveImg.hidden = !live;
+  renderer.domElement.style.visibility = followCamera && camMode === 'live' ? 'hidden' : '';
+  const overlay = followCamera && camMode === 'overlay';
+  scene.background = overlay ? null : themeBackground();
+  if (world.tableGroup) world.tableGroup.visible = !overlay;
+  if (!followCamera) { camera.updateProjectionMatrix(); }
+}
+async function refreshCameraInfo() {
+  try {
+    const r = await fetch(`/camera/info?token=${encodeURIComponent(TOKEN)}`, { cache: 'no-store' });
+    camInfo = await r.json();
+  } catch (e) {
+    camInfo = { available: false, error: 'no answer from the twin' };
+  }
+  const usable = camInfo.available;
+  document.querySelectorAll('[data-cam="live"], [data-cam="overlay"]').forEach((b) => {
+    b.disabled = !usable;
+    b.title = usable ? '' : camInfo.error || 'no live camera';
+  });
+  const note = $('cam-note');
+  note.textContent = !usable ? (camInfo.error || 'no live camera')
+    : camMode !== 'sim' && !camInfo.live ? (camInfo.error || 'waiting for the camera…') : '';
+  note.hidden = !followCamera || !note.textContent;
+  if (!usable && camMode !== 'sim') { camMode = 'sim'; applyCameraMode(); }
+}
+document.querySelectorAll('[data-cam]').forEach((b) => b.addEventListener('click', () => {
+  camMode = b.dataset.cam;
+  applyCameraMode();
+  refreshCameraInfo();
+}));
+$('cam-kind').addEventListener('change', applyCameraMode);
+setInterval(() => { if (followCamera) refreshCameraInfo(); }, 2000);
+refreshCameraInfo();
+
+// The view through the wrist camera with the real camera's intrinsics, so the
+// twin lines up with the live picture (shown whole, centred, in the view).
+function cameraProjection() {
+  const k = camInfo && camInfo.intrinsics;
+  if (!k) return false;
+  const vw = view.clientWidth, vh = Math.max(view.clientHeight, 1);
+  const sc = Math.min(vw / k.width, vh / k.height);           // object-fit: contain
+  const ox = (vw - k.width * sc) / 2, oy = (vh - k.height * sc) / 2;
+  const n = camera.near, f = camera.far;
+  // OpenCV pinhole (x right, y down, z forward) -> three.js clip space
+  camera.projectionMatrix.set(
+    2 * sc * k.fx / vw, 0, 1 - 2 * (ox + sc * k.ppx) / vw, 0,
+    0, 2 * sc * k.fy / vh, 2 * (oy + sc * k.ppy) / vh - 1, 0,
+    0, 0, -(f + n) / (f - n), -2 * f * n / (f - n),
+    0, 0, -1, 0);
+  camera.projectionMatrixInverse.copy(camera.projectionMatrix).invert();
+  return true;
+}
 
 // ============================================================
 // RENDER LOOP
@@ -725,6 +799,7 @@ function frame() {
     robot.root.updateMatrixWorld(true);
     const m = robot.camera.matrixWorld.clone().multiply(flipToThree);
     m.decompose(camera.position, camera.quaternion, new THREE.Vector3());
+    if (!cameraProjection()) camera.updateProjectionMatrix();   // no intrinsics yet: the 42 deg view
   } else {
     orbit.update();
   }

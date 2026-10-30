@@ -76,7 +76,15 @@ button.stop {
 
 main { flex: 1; display: flex; min-height: 0; }
 #view { flex: 1; position: relative; min-width: 0; }
-#view canvas { display: block; width: 100%; height: 100%; }
+#view canvas { display: block; width: 100%; height: 100%; position: relative; z-index: 1; }
+#live-img { position: absolute; inset: 0; width: 100%; height: 100%; object-fit: contain; background: #000; z-index: 0; }
+#hud, #view-tools, #cam-source, #cam-panel { z-index: 2; }
+#cam-source { position: absolute; right: 12px; top: 50px; display: flex; flex-wrap: wrap; justify-content: flex-end;
+  gap: 6px; max-width: calc(100% - 24px); }
+#cam-source[hidden], #cam-note[hidden], #cam-kind[hidden] { display: none; }
+#cam-source button, #cam-source select { background: color-mix(in srgb, var(--panel) 85%, transparent); }
+#cam-source button.active { border-color: var(--accent); color: var(--accent); }
+#cam-note { flex-basis: 100%; text-align: right; color: var(--warn); text-shadow: 0 1px 2px rgb(0 0 0 / 70%); }
 #hud { position: absolute; left: 12px; top: 10px; pointer-events: none; }
 #task { background: color-mix(in srgb, var(--panel) 85%, transparent); padding: 4px 10px; border-radius: 6px; }
 #pick-hint {
@@ -136,4 +144,5 @@ summary { cursor: pointer; font-weight: 650; padding: 4px 0; }
                 box-shadow: 0 6px 20px rgb(0 0 0 / 45%); }
   #armed-banner { position: fixed; left: 0; right: 0; top: 0; z-index: 19; }
   #view-tools { top: auto; bottom: 10px; }
+  #cam-source { top: 10px; }
 }

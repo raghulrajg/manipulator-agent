@@ -326,6 +326,7 @@ class Twin:
         self.runner.cancel = self.cancel
         self.runner.on_status = lambda state, detail: self._set_step(f"{state}" + (f": {detail}" if detail else ""))
         self.fake = None            # the simulated controller, with --sim
+        self.camera = None          # the live wrist camera (camera_stream.py), with --camera
         self.clients_heard = None   # set by the web server: seconds since any browser spoke
         self._tasks = queue.Queue()
         threading.Thread(target=self._worker, daemon=True, name="twin-tasks").start()
@@ -1159,10 +1160,12 @@ def _no_constants(name):
     raise ValueError(f"{name} is not a number")
 
 
-def make_app(twin, model, config, token):
+def make_app(twin, model, config, token, camera=None, camera_fps=15):
     """The twin's web app. Browsers must open it with ?token=... (printed at
     start) and from its own address: a page from anywhere else can't reach
-    the WebSocket that moves the robot."""
+    the WebSocket that moves the robot. camera (camera_stream.py), if
+    given, is served as MJPEG at /camera.mjpg for the Camera view's Live
+    and Overlay modes."""
     from aiohttp import WSMsgType, web
 
     clients = {}                                        # ws -> {"seq": last log sent, "heard": monotonic}
@@ -1290,10 +1293,48 @@ def make_app(twin, model, config, token):
         app["broadcast"].cancel()
         work.shutdown(wait=False)
         stops.shutdown(wait=False)
+        jpeg.shutdown(wait=False)
+
+    jpeg = ThreadPoolExecutor(1, thread_name_prefix="twin-jpeg")   # one encode per frame, off the loop
+
+    async def camera_info(request):
+        if not allowed(request):
+            return web.json_response({"error": "denied"}, status=403)
+        if camera is None:
+            return web.json_response({"available": False,
+                                      "error": "no live camera: start digital_twin.py with --camera"})
+        return web.json_response({"available": True, **camera.info()})
+
+    async def camera_mjpeg(request):
+        """The live picture as MJPEG (an <img> plays it), at most camera_fps."""
+        if not allowed(request):
+            return web.Response(status=403, text="denied")
+        if camera is None:
+            return web.Response(status=404, text="no live camera: start digital_twin.py with --camera")
+        kind = request.query.get("kind", "color")
+        if kind not in ("color", "depth"):
+            return web.Response(status=400, text="kind: color or depth")
+        resp = web.StreamResponse(headers={"Content-Type": "multipart/x-mixed-replace; boundary=frame",
+                                           "Cache-Control": "no-store"})
+        await resp.prepare(request)
+        loop, last = asyncio.get_running_loop(), None
+        try:
+            while True:
+                seq, data = await loop.run_in_executor(jpeg, camera.latest, kind)
+                if data is not None and seq != last:
+                    last = seq
+                    await resp.write(b"--frame\r\nContent-Type: image/jpeg\r\nContent-Length: "
+                                     + str(len(data)).encode() + b"\r\n\r\n" + data + b"\r\n")
+                await asyncio.sleep(1.0 / camera_fps)
+        except (ConnectionResetError, asyncio.CancelledError):
+            pass
+        return resp
 
     app = web.Application()
     app.router.add_get("/", index)
     app.router.add_get("/api/model", api_model)
+    app.router.add_get("/camera/info", camera_info)
+    app.router.add_get("/camera.mjpg", camera_mjpeg)
     app.router.add_get("/ws", ws_handler)
     app.router.add_static("/web/", WEB)
     app.on_startup.append(start_broadcast)
@@ -1351,9 +1392,15 @@ def build(args):
         twin.check_model()
     except DobotError as e:
         twin.log(f"model check failed: {e}", "error")
+    camera = None
+    if args.camera:
+        from camera_stream import open_camera
+        camera = open_camera(args.camera)
+        print(f"live camera: {camera.name}")
     config = {"sim": bool(args.sim), "robot": None if args.sim else args.robot, "table_z": args.table_z,
               "detect": twin.can_detect, "max_speed": args.max_speed,
-              "gripper": "simulated" if isinstance(gripper, FakeGripper) else "Feetech"}
+              "gripper": "simulated" if isinstance(gripper, FakeGripper) else "Feetech",
+              "camera": None if camera is None else camera.name}
 
     def cleanup():
         feedback.stop()
@@ -1363,7 +1410,10 @@ def build(args):
             link.close()
         if fake:
             fake.stop()
+        if camera:
+            camera.stop()
     twin.fake = fake
+    twin.camera = camera
     return twin, config, cleanup
 
 
@@ -1392,7 +1442,13 @@ def main():
     p.add_argument("--mqtt", action="store_true", help="enable Detect: ready / pose with the vision PC over MQTT")
     p.add_argument("--fake-vision", metavar="POSE", help="answer Detect with this 4x4 T_camera_object file or "
                    "'demo' (with --sim only)")
+    p.add_argument("--camera", nargs="?", const="419122270335", metavar="SERIAL",
+                   help="live wrist camera in the Camera view: the RealSense with this serial "
+                        "(default 419122270335, the D405), or 'fake' for a test picture")
+    p.add_argument("--camera-fps", type=int, default=15, help="live picture frames per second to the browser (1..30)")
     args = p.parse_args()
+    if not 1 <= args.camera_fps <= 30:
+        p.error("--camera-fps must be 1..30")
     if args.robot:
         if args.table_z is None:
             p.error("--table-z is required with --robot")
@@ -1415,7 +1471,7 @@ def main():
     from aiohttp import web
     token = args.token or secrets.token_urlsafe(12)
     twin, config, cleanup = build(args)
-    app = make_app(twin, load_model(), config, token)
+    app = make_app(twin, load_model(), config, token, camera=twin.camera, camera_fps=args.camera_fps)
     host = "localhost" if args.host in ("127.0.0.1", "0.0.0.0", "::") else f"[{args.host}]" if ":" in args.host else args.host
     print(f"digital twin ({'simulated robot' if args.sim else 'robot ' + args.robot}): "
           f"open http://{host}:{args.port}/?token={quote(token, safe='')}")
